@@ -25,8 +25,8 @@ use pyo3::prelude::PyDictMethods;
 use pyo3::prelude::{PyAnyMethods, PyListMethods, PyModule};
 use pyo3::types::PyDict;
 use pyo3::types::{PyList, PyType};
-use pyo3::{Bound, Py, PyAny, PyResult, Python};
 use pyo3::{pyclass, pyfunction, pymethods};
+use pyo3::{Bound, Py, PyAny, PyResult, Python};
 use pythonize::pythonize;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
@@ -37,12 +37,12 @@ use tracing::{debug, info, warn};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, reload};
+use tracing_subscriber::{reload, EnvFilter};
 
 #[derive(Debug)]
 pub struct PyPlugin {
     plugin: Arc<Py<PyType>>,
-    pattern: Regex,
+    pattern: Option<Regex>,
     name: String,
 }
 
@@ -50,7 +50,7 @@ impl PyPlugin {
     pub fn from_pytype(class: &Bound<PyType>) -> PyResult<Self> {
         let pattern = class.getattr("VALID_URL_BASE")?.to_string();
         // info!("{pattern}");
-        let re = Regex::new(&pattern).unwrap();
+        let re = Regex::new(&pattern).ok();
         let plugin = class.clone();
         let name: String = class.getattr("__name__")?.extract()?;
         // info!("发现插件类: {name}");
@@ -188,11 +188,13 @@ impl PyDownloader {
 #[async_trait]
 impl DownloadPlugin for PyPlugin {
     fn matches(&self, url: &str) -> bool {
-        if self.pattern.is_match(url).unwrap() {
-            // 找到匹配的部分
-            if let Some(mat) = self.pattern.find(url).unwrap() {
-                debug!("  匹配内容: {}", mat.as_str());
-                return true;
+        if let Some(pattern) = &self.pattern {
+            if pattern.is_match(url).unwrap_or(false) {
+                // 找到匹配的部分
+                if let Ok(Some(mat)) = pattern.find(url) {
+                    debug!("  匹配内容: {}", mat.as_str());
+                    return true;
+                }
             }
         }
         false
@@ -293,10 +295,10 @@ impl OnceConfig {
             .extract::<Bound<PyDict>>()?
             .get_item(key)?
         {
-            if bound.is_none()
-                && let Some(d) = default
-            {
-                return Ok(d);
+            if bound.is_none() {
+                if let Some(d) = default {
+                    return Ok(d);
+                }
             }
             // 尝试转换为字典并过滤
             return match bound.cast::<PyDict>() {
@@ -337,16 +339,19 @@ impl ConfigState {
         key: &str,
         default: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let guard = self.map.read().unwrap();
+        let guard = self
+            .map
+            .read()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("config state lock poisoned"))?;
         // serde_json::to_value(guard.deref())
         if let Some(bound) = pythonize(py, guard.deref())?
             .extract::<Bound<PyDict>>()?
             .get_item(key)?
         {
-            if bound.is_none()
-                && let Some(d) = default
-            {
-                return Ok(d);
+            if bound.is_none() {
+                if let Some(d) = default {
+                    return Ok(d);
+                }
             }
             // 尝试转换为字典并过滤
             return match bound.cast::<PyDict>() {
@@ -417,7 +422,11 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
         // .max_log_files(3)
         // .build("logs") // try to build an appender that stores log files in `/var/log`
         .build("") // try to build an appender that stores log files in `/var/log`
-        .expect("initializing rolling file appender failed");
+        .map_err(|e| {
+            Report::new(AppError::Custom(format!(
+                "initializing rolling file appender failed: {e}"
+            )))
+        })?;
     // 或者按小时滚动
     // let file_appender = tracing_appender::rolling::hourly("logs", "upload.log");
 
@@ -513,15 +522,32 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
             );
             let conn_pool = ConnectionManager::new_pool("data/data.sqlite3")
                 .await
-                .expect("could not initialize the database connection pool");
+                .map_err(|e| {
+                    Report::new(AppError::Custom(format!(
+                        "could not initialize the database connection pool: {e}"
+                    )))
+                })?;
 
-            *CONFIG.write().unwrap() = repositories::get_config(&conn_pool).await?;
+            *CONFIG
+                .write()
+                .map_err(|_| Report::new(AppError::Custom("config lock poisoned".to_string())))? =
+                repositories::get_config(&conn_pool).await?;
             let download_manager = DownloadManager::new(
-                CONFIG.read().unwrap().pool1_size,
-                CONFIG.read().unwrap().pool2_size,
+                CONFIG
+                    .read()
+                    .map_err(|_| Report::new(AppError::Custom("config lock poisoned".to_string())))?
+                    .pool1_size,
+                CONFIG
+                    .read()
+                    .map_err(|_| Report::new(AppError::Custom("config lock poisoned".to_string())))?
+                    .pool2_size,
                 conn_pool.clone(),
             );
-            let vec = from_py().unwrap();
+            let vec = from_py().map_err(|e| {
+                Report::new(AppError::Custom(format!(
+                    "failed to load python plugins: {e}"
+                )))
+            })?;
 
             for v in vec {
                 download_manager.add_plugin(Arc::new(v));
@@ -557,7 +583,9 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
                 .to_socket_addrs()
                 .change_context(AppError::Unknown)?
                 .next()
-                .unwrap();
+                .ok_or_else(|| {
+                    Report::new(AppError::Custom("invalid bind/port address".to_string()))
+                })?;
             ApplicationController::serve(&addr, auth, service_register)
                 .await
                 .attach("could not initialize application routes")?;

@@ -1,6 +1,6 @@
 use crate::downloader::flv_parser::{
-    AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader,
     aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
+    AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader,
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
 use crate::downloader::util::{LifecycleFile, Segmentable};
@@ -62,8 +62,10 @@ pub(crate) async fn parse_flv(
         let flv_tag = match flv_tag_data {
             TagData::Audio(audio_data) => {
                 let packet_type = if audio_data.sound_format == SoundFormat::AAC {
-                    let (_, packet_header) = aac_audio_packet_header(audio_data.sound_data)
-                        .expect("Error in parsing aac audio packet header.");
+                    let (_, packet_header) = map_parse_err(
+                        aac_audio_packet_header(audio_data.sound_data),
+                        "aac audio packet header",
+                    )?;
                     if packet_header.packet_type == AACPacketType::SequenceHeader {
                         if aac_sequence_header.is_some() {
                             warn!("Unexpected aac sequence header tag. {tag_header:?}");
@@ -91,8 +93,10 @@ pub(crate) async fn parse_flv(
             }
             TagData::Video(video_data) => {
                 let (packet_type, composition_time) = if CodecId::H264 == video_data.codec_id {
-                    let (_, avc_video_header) = avc_video_packet_header(video_data.video_data)
-                        .expect("Error in parsing avc video packet header.");
+                    let (_, avc_video_header) = map_parse_err(
+                        avc_video_packet_header(video_data.video_data),
+                        "avc video packet header",
+                    )?;
                     if avc_video_header.packet_type == AVCPacketType::SequenceHeader {
                         if let Some((_, binary_data, _)) = &h264_sequence_header {
                             warn!("Unexpected h264 sequence header tag. {tag_header:?}");
@@ -123,7 +127,7 @@ pub(crate) async fn parse_flv(
                 }
             }
             TagData::Script => {
-                let (_, tag_data) = script_data(i).expect("Error in parsing script tag.");
+                let (_, tag_data) = map_parse_err(script_data(i), "script tag")?;
                 if on_meta_data.is_some() {
                     warn!("Unexpected script tag. {tag_header:?}");
                 }
@@ -168,8 +172,13 @@ pub(crate) async fn parse_flv(
                     segment.set_start_time(Duration::from_millis(timestamp));
                     segment.set_size_position(9 + 4);
 
-                    let (meta_header, meta_bytes, previous_meta_tag_size) =
-                        on_meta_data.as_ref().expect("on_meta_data does not exist");
+                    let Some((meta_header, meta_bytes, previous_meta_tag_size)) =
+                        on_meta_data.as_ref()
+                    else {
+                        return Err(crate::downloader::error::Error::Custom(
+                            "on_meta_data does not exist".to_string(),
+                        ));
+                    };
                     // onMetaData
                     flv_tags_cache.push((
                         *meta_header,
@@ -177,9 +186,11 @@ pub(crate) async fn parse_flv(
                         previous_meta_tag_size.clone(),
                     ));
                     // AACSequenceHeader
-                    let aac_sequence_header = aac_sequence_header
-                        .as_ref()
-                        .expect("aac_sequence_header does not exist");
+                    let Some(aac_sequence_header) = aac_sequence_header.as_ref() else {
+                        return Err(crate::downloader::error::Error::Custom(
+                            "aac_sequence_header does not exist".to_string(),
+                        ));
+                    };
                     flv_tags_cache.push((
                         aac_sequence_header.0,
                         aac_sequence_header.1.clone(),
@@ -190,7 +201,11 @@ pub(crate) async fn parse_flv(
                         flv_tags_cache.push(
                             h264_sequence_header
                                 .as_ref()
-                                .expect("h264_sequence_header does not exist")
+                                .ok_or_else(|| {
+                                    crate::downloader::error::Error::Custom(
+                                        "h264_sequence_header does not exist".to_string(),
+                                    )
+                                })?
                                 .clone(),
                         );
                     }
@@ -218,12 +233,12 @@ pub fn map_parse_err<'a, T>(
             msg.to_string(),
             needed,
         )),
-        Err(Err::Error(e)) => {
-            panic!("parse {msg} err: {e:?}")
-        }
-        Err(Err::Failure(f)) => {
-            panic!("{msg} Failure: {f:?}")
-        }
+        Err(Err::Error(e)) => Err(crate::downloader::error::Error::Custom(format!(
+            "parse {msg} err: {e:?}"
+        ))),
+        Err(Err::Failure(f)) => Err(crate::downloader::error::Error::Custom(format!(
+            "{msg} Failure: {f:?}"
+        ))),
     }
 }
 

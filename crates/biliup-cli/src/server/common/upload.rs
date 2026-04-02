@@ -319,7 +319,7 @@ pub async fn upload(
         Some(UploadLine::Cntx) => line::cntx(),
         Some(UploadLine::Antx) => line::antx(),
         Some(UploadLine::Attx) => line::attx(),
-        // Some(UploadLine::Bda) => line::bda(),
+        Some(UploadLine::Bda) => line::bda(),
         Some(UploadLine::Txa) => line::txa(),
         Some(UploadLine::Alia) => line::alia(),
         _ => Probe::probe(&client.client).await.unwrap_or_default(),
@@ -426,7 +426,12 @@ impl UActor {
                     // 可以添加错误通知机制
                 }
                 info!(url=ctx.live_streamer().url, result=?result, "后处理执行完毕：Finished processing segment event");
-                ctx.change_status(Stage::Upload, WorkerStatus::Idle).await;
+                let upload_status = if result.is_ok() {
+                    WorkerStatus::Completed
+                } else {
+                    WorkerStatus::Idle
+                };
+                ctx.change_status(Stage::Upload, upload_status).await;
             }
         }
     }

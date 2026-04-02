@@ -1,24 +1,24 @@
-use crate::UploadLine;
 use crate::server::errors::{AppError, AppResult};
 use crate::upload_lock::UploadLock;
+use crate::UploadLine;
 use biliup::client::StatelessClient;
 use biliup::error::Kind;
 use biliup::uploader::bilibili::{BiliBili, Studio, Vid, Video};
 use biliup::uploader::credential::{Credential, LoginInfo};
 use biliup::uploader::line::Probe;
 use biliup::uploader::util::SubmitOption;
-use biliup::uploader::{VideoFile, credential, line, load_config};
+use biliup::uploader::{credential, line, load_config, VideoFile};
 use bytes::{Buf, Bytes};
 use clap::ValueEnum;
+use dialoguer::theme::ColorfulTheme;
 use dialoguer::Input;
 use dialoguer::Select;
-use dialoguer::theme::ColorfulTheme;
 use error_stack::ResultExt;
 use futures::{Stream, StreamExt};
 use image::Luma;
 use indicatif::{ProgressBar, ProgressStyle};
-use qrcode::QrCode;
 use qrcode::render::unicode;
+use qrcode::QrCode;
 use reqwest::Body;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -92,7 +92,11 @@ pub async fn login(user_cookie: PathBuf, proxy: Option<&str>) -> AppResult<()> {
         3 => login_by_browser(client).await?,
         4 => login_by_web_cookies(client).await?,
         5 => login_by_webqr_cookies(client).await?,
-        _ => panic!(),
+        _ => {
+            return Err(
+                AppError::Custom(format!("invalid login method selection: {selection}")).into(),
+            );
+        }
     };
     let file = std::fs::File::create(user_cookie).change_context_lazy(|| AppError::Unknown)?;
     serde_json::to_writer_pretty(&file, &info).change_context_lazy(|| AppError::Unknown)?;
@@ -138,7 +142,8 @@ pub async fn upload_by_command(
             .file_stem()
             .and_then(OsStr::to_str)
             .map(|s| s.to_string())
-            .unwrap();
+            .ok_or_else(|| AppError::Custom("video file name is missing a valid stem".into()))
+            .change_context_lazy(|| AppError::Unknown)?;
     }
     cover_up(&mut studio, &bili).await?;
     studio.videos = upload(&video_path, &bili, line, limit).await?;
@@ -390,7 +395,7 @@ pub async fn upload(
         Some(UploadLine::Cntx) => line::cntx(),
         Some(UploadLine::Antx) => line::antx(),
         Some(UploadLine::Attx) => line::attx(),
-        // Some(UploadLine::Bda) => line::bda(),
+        Some(UploadLine::Bda) => line::bda(),
         Some(UploadLine::Txa) => line::txa(),
         Some(UploadLine::Alia) => line::alia(),
         _ => Probe::probe(&client.client).await.unwrap_or_default(),
@@ -420,7 +425,9 @@ pub async fn upload(
 
         // 在开始上传前检查是否有其他进程正在等待限流恢复
         {
-            let lock = upload_lock.lock().unwrap();
+            let lock = upload_lock
+                .lock()
+                .map_err(|_| AppError::Custom("upload lock mutex poisoned".into()))?;
             if lock.is_locked() {
                 return Err(AppError::Custom(format!(
                     "另一个使用该账号 ({}) 的上传进程正在等待限流恢复，请稍后重试",
@@ -448,10 +455,22 @@ pub async fn upload(
                 5,
                 Some(move |e: &Kind| {
                     if matches!(e, Kind::RateLimit { .. }) {
-                        let mut acquired = lock_acquired_clone.lock().unwrap();
+                        let mut acquired = match lock_acquired_clone.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                warn!("lock_acquired mutex poisoned");
+                                return true;
+                            }
+                        };
                         if !*acquired {
                             // 第一次遇到限流错误，尝试获取锁
-                            let mut lock = upload_lock_clone.lock().unwrap();
+                            let mut lock = match upload_lock_clone.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    warn!("upload_lock mutex poisoned");
+                                    return true;
+                                }
+                            };
                             match lock.try_acquire() {
                                 Ok(true) => {
                                     info!("检测到限流，成功获取上传锁，将进行重试");
@@ -481,8 +500,13 @@ pub async fn upload(
         };
 
         // 上传成功后释放锁
-        if *lock_acquired.lock().unwrap() {
-            let mut lock = upload_lock.lock().unwrap();
+        let should_release = *lock_acquired
+            .lock()
+            .map_err(|_| AppError::Custom("lock_acquired mutex poisoned".into()))?;
+        if should_release {
+            let mut lock = upload_lock
+                .lock()
+                .map_err(|_| AppError::Custom("upload lock mutex poisoned".into()))?;
             let _ = lock.release();
         }
         //Progress bar
@@ -596,13 +620,12 @@ pub async fn login_by_qrcode(credential: Credential) -> AppResult<LoginInfo> {
         .get_qrcode()
         .await
         .change_context_lazy(|| AppError::Unknown)?;
-    let code = QrCode::new(
-        value["data"]["url"]
-            .as_str()
-            .unwrap()
-            .replace("https", "http"),
-    )
-    .unwrap();
+    let qrcode_url = value["data"]["url"]
+        .as_str()
+        .ok_or_else(|| AppError::Custom(format!("missing qrcode url: {value}")))
+        .change_context_lazy(|| AppError::Unknown)?;
+    let code = QrCode::new(qrcode_url.replace("https", "http"))
+        .map_err(|e| AppError::Custom(format!("failed to build qrcode: {e}")))?;
     let image = code
         .render::<unicode::Dense1x2>()
         .dark_color(unicode::Dense1x2::Light)
@@ -615,7 +638,9 @@ pub async fn login_by_qrcode(credential: Credential) -> AppResult<LoginInfo> {
         "在Windows下建议使用Windows Terminal(支持utf8，可完整显示二维码)\n否则可能无法正常显示，此时请打开./qrcode.png扫码"
     );
     // Save the image.
-    image.save("qrcode.png").unwrap();
+    image
+        .save("qrcode.png")
+        .change_context_lazy(|| AppError::Custom("failed to save qrcode.png".into()))?;
     credential
         .login_by_qrcode(value)
         .await

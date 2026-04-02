@@ -7,12 +7,12 @@ use biliup::downloader::flv_parser::header;
 use biliup::downloader::httpflv::Connection;
 use biliup::downloader::util::{LifecycleFile, Segmentable};
 use biliup::downloader::{hls, httpflv};
-use error_stack::{ResultExt, bail};
+use error_stack::{bail, ResultExt};
 use nom::Err;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Stream-gears下载器实现
 /// 使用stream-gears库进行直播流下载
@@ -122,8 +122,20 @@ impl StreamGears {
         callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
         download_config: DownloadConfig,
     ) -> AppResult<DownloadStatus> {
-        *self.token.write().unwrap() = CancellationToken::new();
-        let token = self.token.read().unwrap().clone();
+        let token = CancellationToken::new();
+        {
+            let mut guard = self.token.write().map_err(|_| {
+                error_stack::Report::new(AppError::Custom("StreamGears token lock poisoned".into()))
+            })?;
+            *guard = token.clone();
+        }
+        let token = self
+            .token
+            .read()
+            .map_err(|_| {
+                error_stack::Report::new(AppError::Custom("StreamGears token lock poisoned".into()))
+            })?
+            .clone();
         tokio::select! {
             _ = token.cancelled() => {
                 bail!(AppError::Custom("StreamGears token cancelled".into()))
@@ -136,7 +148,10 @@ impl StreamGears {
     pub(crate) async fn stop(&self) -> AppResult<()> {
         // 仅发出取消信号并更新状态
         // 如果底层下载函数不支持取消，这里不能真正中断正在进行的下载
-        self.token.read().unwrap().cancel();
+        match self.token.read() {
+            Ok(token) => token.cancel(),
+            Err(_) => warn!("StreamGears token lock poisoned while stopping"),
+        }
         Ok(())
     }
 }

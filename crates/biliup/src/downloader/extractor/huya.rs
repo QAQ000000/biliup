@@ -10,9 +10,10 @@ pub struct HuyaLive {}
 #[async_trait]
 impl SiteDefinition for HuyaLive {
     fn can_handle_url(&self, url: &str) -> bool {
-        regex::Regex::new(r"(?:https?://)?(?:(?:www|m)\.)?huya\.com")
-            .unwrap()
-            .is_match(url)
+        match regex::Regex::new(r"(?:https?://)?(?:(?:www|m)\.)?huya\.com") {
+            Ok(re) => re.is_match(url),
+            Err(_) => false,
+        }
     }
 
     async fn get_site(&self, url: &str, client: StatelessClient) -> Result<Site> {
@@ -20,12 +21,16 @@ impl SiteDefinition for HuyaLive {
         // println!("{:?}", response);
 
         let text = response.text().await?;
-        let mut stream: Value = match regex::Regex::new(r"stream: (\{.+)\n.*?\};")
-            .unwrap()
-            .captures(&text)
-        {
-            Some(captures) => serde_json::from_str(&captures[1])?,
-            _ => {
+        let mut stream: Value = match regex::Regex::new(r"stream: (\{.+)\n.*?\};") {
+            Ok(re) => match re.captures(&text) {
+                Some(captures) => serde_json::from_str(&captures[1])?,
+                _ => {
+                    return Err(crate::downloader::error::Error::Custom(format!(
+                        "Not online: {text}"
+                    )));
+                }
+            },
+            Err(_) => {
                 return Err(crate::downloader::error::Error::Custom(format!(
                     "Not online: {text}"
                 )));
@@ -48,10 +53,26 @@ impl SiteDefinition for HuyaLive {
         // let ratio = ;
         let direct_url = format!(
             "{}/{}.{}?{}&ratio={}",
-            game_stream_info["sFlvUrl"].as_str().unwrap(),
-            game_stream_info["sStreamName"].as_str().unwrap(),
-            game_stream_info["sFlvUrlSuffix"].as_str().unwrap(),
-            game_stream_info["sFlvAntiCode"].as_str().unwrap(),
+            game_stream_info["sFlvUrl"].as_str().ok_or_else(|| {
+                crate::downloader::error::Error::Custom(format!(
+                    "Missing flv url: {game_stream_info}"
+                ))
+            })?,
+            game_stream_info["sStreamName"].as_str().ok_or_else(|| {
+                crate::downloader::error::Error::Custom(format!(
+                    "Missing stream name: {game_stream_info}"
+                ))
+            })?,
+            game_stream_info["sFlvUrlSuffix"].as_str().ok_or_else(|| {
+                crate::downloader::error::Error::Custom(format!(
+                    "Missing url suffix: {game_stream_info}"
+                ))
+            })?,
+            game_stream_info["sFlvAntiCode"].as_str().ok_or_else(|| {
+                crate::downloader::error::Error::Custom(format!(
+                    "Missing anti code: {game_stream_info}"
+                ))
+            })?,
             v_multi_stream_info[0]["iBitRate"].take()
         );
         // println!("{}", direct_url);
@@ -59,7 +80,9 @@ impl SiteDefinition for HuyaLive {
             name: "huya",
             title: game["gameLiveInfo"]["introduction"]
                 .as_str()
-                .unwrap()
+                .ok_or_else(|| {
+                    crate::downloader::error::Error::Custom(format!("Missing title: {game}"))
+                })?
                 .to_string(),
             direct_url,
             extension: Extension::Flv,

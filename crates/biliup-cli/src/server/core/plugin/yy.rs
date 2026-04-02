@@ -5,9 +5,9 @@ use crate::server::infrastructure::context::{Context, PluginContext};
 use crate::server::infrastructure::models::StreamerInfo;
 use async_trait::async_trait;
 use chrono::Utc;
-use error_stack::{Report, ResultExt, bail};
+use error_stack::{bail, Report, ResultExt};
 use regex::Regex;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,8 +35,11 @@ impl DownloadBase for YYDownloader {
     async fn check_stream(&mut self) -> Result<StreamStatus, Report<AppError>> {
         let mut fake_headers = self.fake_headers.clone();
         // 设置headers
-        fake_headers.insert("content-type", "text/plain;charset=UTF-8".parse().unwrap());
-        fake_headers.insert("referer", "https://www.yy.com/".parse().unwrap());
+        fake_headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/plain;charset=UTF-8"),
+        );
+        fake_headers.insert("referer", HeaderValue::from_static("https://www.yy.com/"));
 
         // 提取房间ID
         let rid = match self.url.split("www.yy.com/").nth(1) {
@@ -53,7 +56,7 @@ impl DownloadBase for YYDownloader {
         // 获取时间戳
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("时间错误");
+            .change_context(AppError::Custom("时间错误".to_string()))?;
         let millis_13 = now.as_millis() as u64;
         let millis_10 = now.as_secs();
 
@@ -145,7 +148,7 @@ impl DownloadBase for YYDownloader {
                     date: Utc::now(),
                     live_cover_path: "".to_string(),
                 },
-                suffix: media_ext_from_url(&raw_stream_url).unwrap(),
+                suffix: media_ext_from_url(&raw_stream_url).unwrap_or_else(|| "flv".to_string()),
                 raw_stream_url,
                 platform: String::from("YY"),
                 stream_headers: HashMap::new(),
@@ -155,7 +158,7 @@ impl DownloadBase for YYDownloader {
 }
 
 pub struct YY {
-    re: Regex,
+    re: Option<Regex>,
 }
 
 impl Default for YY {
@@ -167,14 +170,14 @@ impl Default for YY {
 impl YY {
     pub fn new() -> Self {
         Self {
-            re: Regex::new(r"(?:https?://)?(?:www\.)?yy\.com").unwrap(),
+            re: Regex::new(r"(?:https?://)?(?:www\.)?yy\.com").ok(),
         }
     }
 }
 
 impl DownloadPlugin for YY {
     fn matches(&self, url: &str) -> bool {
-        self.re.is_match(url)
+        self.re.as_ref().is_some_and(|re| re.is_match(url))
     }
 
     fn create_downloader(&self, ctx: &mut PluginContext) -> Box<dyn DownloadBase> {

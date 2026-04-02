@@ -13,9 +13,10 @@ pub struct DouyuLive;
 #[async_trait]
 impl SiteDefinition for DouyuLive {
     fn can_handle_url(&self, url: &str) -> bool {
-        regex::Regex::new(r"(?:https?://)?(?:(?:www|m)\.)?douyu\.com")
-            .unwrap()
-            .is_match(url)
+        match regex::Regex::new(r"(?:https?://)?(?:(?:www|m)\.)?douyu\.com") {
+            Ok(re) => re.is_match(url),
+            Err(_) => false,
+        }
     }
 
     async fn get_site(
@@ -34,7 +35,7 @@ impl SiteDefinition for DouyuLive {
         // Compile each pattern independently.
         let room_id = patterns
             .iter()
-            .map(|pat| regex::Regex::new(pat).unwrap())
+            .filter_map(|pat| regex::Regex::new(pat).ok())
             .find_map(|pat| pat.captures(&text))
             .map(|captures| captures[1].to_string())
             .ok_or_else(|| Error::Custom(format!("Wrong url: {url}")))?;
@@ -49,7 +50,7 @@ impl SiteDefinition for DouyuLive {
 
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|_| Error::Custom("system time error".to_string()))?
             .as_micros();
         let mut hasher = Md5::new();
         hasher.update(format!("{room_id}{time}"));
@@ -72,23 +73,24 @@ impl SiteDefinition for DouyuLive {
             .await?
             .json()
             .await?;
-        if result["error"] == 0
-            && let Some(key) = regex::Regex::new(r"(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}(/playlist|.m3u8)")
-                .unwrap()
-                .captures(&result["data"]["rtmp_live"].to_string())
-        {
-            return Ok(Site {
-                name: "douyu",
-                title: room_info
-                    .get("room")
-                    .and_then(|room| room.get("room_name"))
-                    .and_then(|name| name.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                direct_url: format!("https://hw-tct.douyucdn.cn/live/{}.flv?uuid=", &key[1]),
-                extension: Extension::Flv,
-                client,
-            });
+        if result["error"] == 0 {
+            if let Some(key) = regex::Regex::new(r"(\d{1,8}[0-9a-zA-Z]+)_?\d{0,4}(/playlist|.m3u8)")
+                .ok()
+                .and_then(|re| re.captures(&result["data"]["rtmp_live"].to_string()))
+            {
+                return Ok(Site {
+                    name: "douyu",
+                    title: room_info
+                        .get("room")
+                        .and_then(|room| room.get("room_name"))
+                        .and_then(|name| name.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    direct_url: format!("https://hw-tct.douyucdn.cn/live/{}.flv?uuid=", &key[1]),
+                    extension: Extension::Flv,
+                    client,
+                });
+            }
         }
         Err(Error::Custom(result.to_string()))
     }

@@ -11,8 +11,9 @@ use crate::client::StatelessClient;
 use crate::error::Kind::{Custom, RateLimit};
 use crate::uploader::bilibili::{BiliBili, Video};
 use crate::uploader::line::upos::Upos;
-use std::time::Instant;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
+use tracing::{info, warn};
 
 pub mod upos;
 
@@ -57,14 +58,15 @@ impl Parcel {
         };
 
         if video.title.is_none()
-            && let Some(filename) = self.video_file.filepath.file_stem().and_then(OsStr::to_str) {
-                // B站限制分P视频标题不能超过80字符，需要截断
-                video.title = Some(if filename.chars().count() >= 80 {
-                    Video::truncate_title(filename, 80)
-                } else {
-                    filename.to_string()
-                });
-            };
+            && let Some(filename) = self.video_file.filepath.file_stem().and_then(OsStr::to_str)
+        {
+            // B站限制分P视频标题不能超过80字符，需要截断
+            video.title = Some(if filename.chars().count() >= 80 {
+                Video::truncate_title(filename, 80)
+            } else {
+                filename.to_string()
+            });
+        };
         Ok(video)
     }
 }
@@ -89,18 +91,33 @@ impl Probe {
         let mut choice_line: Line = Default::default();
         for mut line in res.lines {
             let instant = Instant::now();
-            if Probe::ping(&res.probe, &format!("https:{}", line.probe_url), client)
-                .send()
-                .await?
-                .status()
-                .is_success()
-            {
-                line.cost = instant.elapsed().as_millis();
-                info!("{}: {}", line.query, line.cost);
-                if choice_line.cost > line.cost {
-                    choice_line = line
+            let probe_result = timeout(
+                Duration::from_secs(5),
+                Probe::ping(&res.probe, &format!("https:{}", line.probe_url), client).send(),
+            )
+            .await;
+            match probe_result {
+                Ok(Ok(response)) if response.status().is_success() => {
+                    line.cost = instant.elapsed().as_millis();
+                    info!("{}: {}", line.query, line.cost);
+                    if choice_line.cost > line.cost {
+                        choice_line = line
+                    }
                 }
-            };
+                Ok(Ok(response)) => {
+                    warn!(
+                        status = ?response.status(),
+                        query = %line.query,
+                        "upload line probe returned non-success status"
+                    );
+                }
+                Ok(Err(err)) => {
+                    warn!(error = ?err, query = %line.query, "upload line probe failed");
+                }
+                Err(_) => {
+                    warn!(query = %line.query, "upload line probe timed out");
+                }
+            }
         }
         Ok(choice_line)
     }
@@ -164,15 +181,16 @@ impl Line {
             // 尝试解析JSON错误响应，检测限流错误（code: 601）
             if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&response_text)
                 && let Some(code) = error_json.get("code").and_then(|c| c.as_i64())
-                    && code == 601 {
-                        let message = error_json
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("上传过快")
-                            .to_string();
-                        // 直接返回限流错误，让调用方决定如何处理
-                        return Err(RateLimit { code, message });
-                    }
+                && code == 601
+            {
+                let message = error_json
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("上传过快")
+                    .to_string();
+                // 直接返回限流错误，让调用方决定如何处理
+                return Err(RateLimit { code, message });
+            }
 
             return Err(Custom(format!(
                 "Failed to pre_upload from {}",

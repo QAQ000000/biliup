@@ -1,12 +1,12 @@
 use crate::server::common::download::DownloadTask;
 use crate::server::common::util::Recorder;
-use crate::server::config::{Config, default_segment_time};
+use crate::server::config::{default_segment_time, Config};
 use crate::server::core::downloader::DownloadConfig;
 use crate::server::core::plugin::StreamInfoExt;
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use crate::server::infrastructure::models::StreamerInfo;
 use crate::server::infrastructure::models::live_streamer::LiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
+use crate::server::infrastructure::models::StreamerInfo;
 use axum::http::Extensions;
 use biliup::client::StatelessClient;
 use core::fmt;
@@ -78,8 +78,18 @@ impl Context {
 
     pub fn status(&self, stage: Stage) -> WorkerStatus {
         match stage {
-            Stage::Download => self.worker.downloader_status.read().unwrap().clone(),
-            Stage::Upload => self.worker.uploader_status.read().unwrap().clone(),
+            Stage::Download => self
+                .worker
+                .downloader_status
+                .read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            Stage::Upload => self
+                .worker
+                .uploader_status
+                .read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -189,7 +199,11 @@ impl Worker {
     /// 获取覆写配置
     /// 返回当前的配置副本
     pub fn get_config(&self) -> Config {
-        let mut cfg = self.config.read().unwrap().clone();
+        let mut cfg = self
+            .config
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         if let Some(cfg_p) = self.live_streamer.override_cfg.clone() {
             cfg.apply(cfg_p)
@@ -205,25 +219,35 @@ impl Worker {
     pub async fn change_status(&self, stage: Stage, status: WorkerStatus) {
         match stage {
             Stage::Download => {
-                let task = if let WorkerStatus::Working(task) =
-                    &*self.downloader_status.read().unwrap()
-                    && !matches!(status, WorkerStatus::Working(_))
-                {
-                    Some(task.clone())
+                let current_status = self
+                    .downloader_status
+                    .read()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                let task = if let WorkerStatus::Working(task) = &current_status {
+                    if !matches!(status, WorkerStatus::Working(_)) {
+                        Some(task.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
 
-                *self.downloader_status.write().unwrap() = status;
+                if let Ok(mut guard) = self.downloader_status.write() {
+                    *guard = status;
+                }
 
-                if let Some(task) = task
-                    && let Err(e) = task.stop().await
-                {
-                    error!(error = ?e, "Failed to stop downloader");
+                if let Some(task) = task {
+                    if let Err(e) = task.stop().await {
+                        error!(error = ?e, "Failed to stop downloader");
+                    }
                 }
             }
             Stage::Upload => {
-                *self.uploader_status.write().unwrap() = status;
+                if let Ok(mut guard) = self.uploader_status.write() {
+                    *guard = status;
+                }
             }
         }
     }
@@ -265,6 +289,8 @@ pub enum WorkerStatus {
     Working(Arc<DownloadTask>),
     /// 等待中
     Pending,
+    /// å½å¶å·²ç»ç»æ
+    Completed,
     /// 空闲状态（默认）
     #[default]
     Idle,
@@ -278,6 +304,7 @@ impl fmt::Debug for WorkerStatus {
         let name = match self {
             WorkerStatus::Working(_) => "Working",
             WorkerStatus::Pending => "Pending",
+            WorkerStatus::Completed => "Completed",
             WorkerStatus::Idle => "Idle",
             WorkerStatus::Pause => "Pause",
         };

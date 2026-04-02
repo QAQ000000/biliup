@@ -10,7 +10,10 @@ import {useEffect, useState} from "react";
 
 
 export default function useStreamers() {
-  const { data, error, isLoading } = useSWR<LiveStreamerEntity[]>("/v1/streamers", fetcher);
+  const { data, error, isLoading } = useSWR<LiveStreamerEntity[]>("/v1/streamers", fetcher, {
+    refreshInterval: 10_000,
+    revalidateOnFocus: true,
+  });
 
   return {
     isLoading,

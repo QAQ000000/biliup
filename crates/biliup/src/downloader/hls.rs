@@ -37,7 +37,9 @@ pub async fn download(
                 _ => {
                     let mut file = File::create("test.fmp4")?;
                     file.write_all(&bs)?;
-                    panic!("Unable to parse the content.")
+                    return Err(crate::downloader::error::Error::Custom(
+                        "Unable to parse m3u8 media playlist".to_string(),
+                    ));
                 }
             }
         }
@@ -46,14 +48,20 @@ pub async fn download(
             info!("index {}", pl.media_sequence);
             pl
         }
-        Err(e) => panic!("Parsing error: \n{}", e),
+        Err(e) => {
+            return Err(crate::downloader::error::Error::Custom(format!(
+                "Parsing error: {e}"
+            )));
+        }
     };
     let mut previous_last_segment = 0;
+    let mut stagnant_reloads = 0;
     loop {
         if pl.segments.is_empty() {
             info!("Segments array is empty - stream finished");
             break;
         }
+        let mut progressed = false;
         let mut seq = pl.media_sequence;
         for segment in &pl.segments {
             if seq > previous_last_segment {
@@ -80,9 +88,24 @@ pub async fn download(
                     splitting.reset();
                 }
                 previous_last_segment = seq;
+                progressed = true;
             }
             seq += 1;
         }
+
+        if progressed {
+            stagnant_reloads = 0;
+        } else {
+            stagnant_reloads += 1;
+            if stagnant_reloads >= 3 {
+                info!(
+                    "No new segments after {} reloads - stream finished",
+                    stagnant_reloads
+                );
+                break;
+            }
+        }
+
         let resp = client.retryable(media_url.as_str()).await?;
         let bs = resp.bytes().await?;
         if let Ok((_, playlist)) = m3u8_rs::parse_media_playlist(&bs) {

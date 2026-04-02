@@ -10,11 +10,12 @@ use crate::server::common::util::Recorder;
 use crate::server::core::downloader::ffmpeg_downloader::FfmpegDownloader;
 use crate::server::core::downloader::stream_gears::StreamGears;
 use crate::server::core::downloader::streamlink::Streamlink;
-use crate::server::errors::AppResult;
+use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tracing::warn;
 
 /// 下载器配置
 /// 包含下载过程中需要的各种参数和设置
@@ -90,8 +91,22 @@ impl DownloaderRuntime {
                 Vec::new(),
                 DownloaderType::FfmpegExternal,
             )),
-            _ => Self::StreamGears(StreamGears::new(None)),
-            // ...
+            DownloaderType::StreamGears => Self::StreamGears(StreamGears::new(None)),
+            DownloaderType::Streamlink => {
+                warn!("Streamlink runtime is not fully wired yet; falling back to StreamGears");
+                Self::StreamGears(StreamGears::new(None))
+            }
+            DownloaderType::Ytarchive
+            | DownloaderType::SyncDownloader
+            | DownloaderType::YtDlp
+            | DownloaderType::FfmpegExternal
+            | DownloaderType::FfmpegInternal => {
+                warn!(
+                    downloader_type = ?downloader_type,
+                    "Requested downloader type is not implemented in this runtime; falling back to StreamGears"
+                );
+                Self::StreamGears(StreamGears::new(None))
+            }
         }
     }
 
@@ -103,9 +118,9 @@ impl DownloaderRuntime {
         match self {
             Self::Ffmpeg(d) => d.download(callback, download_config).await,
             Self::StreamGears(d) => d.download(callback, download_config).await,
-            DownloaderRuntime::StreamLink(_) => {
-                todo!()
-            }
+            DownloaderRuntime::StreamLink(_) => Err(error_stack::Report::new(AppError::Custom(
+                "StreamLink runtime download is not implemented".to_string(),
+            ))),
         }
     }
 

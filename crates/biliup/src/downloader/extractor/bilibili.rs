@@ -11,14 +11,22 @@ pub struct BiliLive {}
 #[async_trait]
 impl SiteDefinition for BiliLive {
     fn can_handle_url(&self, url: &str) -> bool {
-        regex::Regex::new(r"(?:https?://)?(?:(?:www|m|live)\.)?bilibili\.com")
-            .unwrap()
-            .is_match(url)
+        match regex::Regex::new(r"(?:https?://)?(?:(?:www|m|live)\.)?bilibili\.com") {
+            Ok(re) => re.is_match(url),
+            Err(_) => false,
+        }
     }
 
     async fn get_site(&self, url: &str, mut client: StatelessClient) -> Result<Site> {
-        let rid: u32 = match regex::Regex::new(r"/(\d+)").unwrap().captures(url) {
-            Some(captures) => captures[1].parse().unwrap(),
+        let rid: u32 = match regex::Regex::new(r"/(\d+)") {
+            Ok(re) => match re.captures(url) {
+                Some(captures) => captures[1]
+                    .parse()
+                    .map_err(|_| Error::Custom(format!("Wrong url: {url}")))?,
+                _ => {
+                    return Err(Error::Custom(format!("Wrong url: {url}")));
+                }
+            },
             _ => {
                 return Err(Error::Custom(format!("Wrong url: {url}")));
             }
@@ -105,7 +113,7 @@ impl SiteDefinition for BiliLive {
             name: "bilibili",
             title: room_info["data"]["room_info"]["title"]
                 .as_str()
-                .unwrap()
+                .ok_or_else(|| Error::Custom(format!("Missing room title: {room_info}")))?
                 .to_string(),
             direct_url,
             extension: Extension::Flv,

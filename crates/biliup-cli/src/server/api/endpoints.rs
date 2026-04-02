@@ -2,7 +2,7 @@ use crate::server::common::upload::{build_studio, submit_to_bilibili, upload};
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
-use crate::server::errors::{AppError, report_to_response};
+use crate::server::errors::{report_to_response, AppError};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Stage, WorkerStatus};
 use crate::server::infrastructure::dto::LiveStreamerResponse;
@@ -18,10 +18,10 @@ use crate::server::infrastructure::repositories::{
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::{LogHandle, UploadLine};
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use biliup::credential::Credential;
 use chrono::Utc;
 use clap::ValueEnum;
@@ -51,7 +51,11 @@ pub async fn get_streamers_endpoint(
             .find(|worker| worker.live_streamer.id == x.id);
 
         let status = match option.as_ref() {
-            Some(t) => format!("{:?}", *t.downloader_status.read().unwrap()),
+            Some(t) => t
+                .downloader_status
+                .read()
+                .map(|guard| format!("{:?}", *guard))
+                .unwrap_or_else(|_| String::from("Poisoned")),
             None => String::new(),
         };
 
@@ -59,7 +63,12 @@ pub async fn get_streamers_endpoint(
             status,
             inner: x,
             upload_status: option
-                .map(|t| format!("{:?}", *t.uploader_status.read().unwrap()))
+                .map(|t| {
+                    t.uploader_status
+                        .read()
+                        .map(|guard| format!("{:?}", *guard))
+                        .unwrap_or_else(|_| String::from("Poisoned"))
+                })
                 .unwrap_or_default(),
         });
     }
@@ -142,7 +151,11 @@ pub async fn pause_streamers_endpoint(
 ) -> Result<Json<()>, Response> {
     let worker = managers.get_room_by_id(id).await;
     if let Some(w) = worker {
-        let worker_status = w.downloader_status.read().unwrap().clone();
+        let worker_status = w
+            .downloader_status
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         match worker_status {
             WorkerStatus::Working(_) => {
                 w.change_status(Stage::Download, WorkerStatus::Pause).await;
@@ -159,7 +172,7 @@ pub async fn pause_streamers_endpoint(
                 managers.make_waker(id).await;
                 info!(url=?&w.live_streamer.url, "successfully pause live streamers");
             }
-            WorkerStatus::Idle => {
+            WorkerStatus::Completed | WorkerStatus::Idle => {
                 w.change_status(Stage::Download, WorkerStatus::Pause).await;
                 managers.make_waker(id).await;
                 info!(url=?&w.live_streamer.url, "successfully pause live streamers");
@@ -173,7 +186,10 @@ pub async fn pause_streamers_endpoint(
 pub async fn get_configuration(
     State(config): State<Arc<RwLock<Config>>>,
 ) -> Result<Json<Config>, Response> {
-    Ok(Json(config.read().unwrap().clone()))
+    let guard = config
+        .read()
+        .map_err(|_| report_to_response(AppError::Custom("config lock poisoned".to_string())))?;
+    Ok(Json(guard.clone()))
 }
 
 // #[axum_macros::debug_handler(state = ServiceRegister)]
@@ -258,8 +274,13 @@ pub async fn put_configuration(
     let saved_config: Config = serde_json::from_str(&saved.value)
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    *config.write().unwrap() = saved_config;
-    let guard = config.read().unwrap();
+    *config
+        .write()
+        .map_err(|_| report_to_response(AppError::Custom("config lock poisoned".to_string())))? =
+        saved_config;
+    let guard = config
+        .read()
+        .map_err(|_| report_to_response(AppError::Custom("config lock poisoned".to_string())))?;
     if let Some(loggers_level) = &guard.loggers_level {
         let new_filter = EnvFilter::try_new(loggers_level)
             .change_context(AppError::Custom(String::from("Invalid log level format")))
@@ -457,7 +478,10 @@ pub async fn login_by_qrcode(
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    file.write_all(&serde_json::to_vec_pretty(&info).unwrap())
+    let payload = serde_json::to_vec_pretty(&info)
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    file.write_all(&payload)
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
@@ -482,26 +506,28 @@ pub async fn get_videos() -> Result<Json<Vec<serde_json::Value>>, Response> {
                 continue;
             }
 
-            if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && media_extensions
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if media_extensions
                     .iter()
                     .any(|allowed| ext == allowed.trim_start_matches('.'))
-                && let Ok(metadata) = entry.metadata().await
-            {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                {
+                    if let Ok(metadata) = entry.metadata().await {
+                        let mtime = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
 
-                file_list.push(serde_json::json!({
-                    "key": index,
-                    "name": file_name,
-                    "updateTime": mtime,
-                    "size": metadata.len(),
-                }));
-                index += 1;
+                        file_list.push(serde_json::json!({
+                            "key": index,
+                            "name": file_name,
+                            "updateTime": mtime,
+                            "size": metadata.len(),
+                        }));
+                        index += 1;
+                    }
+                }
             }
         }
     }
@@ -519,8 +545,16 @@ pub async fn get_status(
     let mut sw = Vec::new();
     for worker in &workers {
         sw.push(serde_json::json!({
-            "downloader_status": format!("{:?}", worker.downloader_status.read()),
-            "uploader_status": format!("{:?}", worker.uploader_status.read().unwrap()),
+            "downloader_status": worker
+                .downloader_status
+                .read()
+                .map(|guard| format!("{:?}", *guard))
+                .unwrap_or_else(|_| String::from("Poisoned")),
+            "uploader_status": worker
+                .uploader_status
+                .read()
+                .map(|guard| format!("{:?}", *guard))
+                .unwrap_or_else(|_| String::from("Poisoned")),
             "live_streamer": worker.live_streamer,
             "upload_streamer": worker.upload_streamer,
         }));
@@ -548,7 +582,9 @@ pub async fn post_uploads(
 ) -> Result<Json<serde_json::Value>, Response> {
     let upload_config = json_data.params;
     let (line, limit, submit_api) = {
-        let config = config.read().unwrap();
+        let config = config.read().map_err(|_| {
+            report_to_response(AppError::Custom("config lock poisoned".to_string()))
+        })?;
         let line = UploadLine::from_str(&config.lines, true).ok();
         let limit = config.threads;
         let submit_api = config.submit_api.clone();

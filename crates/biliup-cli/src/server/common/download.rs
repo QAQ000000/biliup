@@ -12,7 +12,7 @@ use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
 use crate::server::infrastructure::models::hook_step::process;
 use async_channel::{Receiver, Sender};
-use error_stack::{ResultExt, bail};
+use error_stack::{bail, ResultExt};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,6 +101,12 @@ impl SegmentEventProcessor {
 
         Ok(())
     }
+
+    pub fn finish(&mut self) {
+        // Close the current segment stream so the uploader can flush
+        // and submit finished files before any retry starts a new batch.
+        self.channel.take();
+    }
 }
 
 /// 下载任务
@@ -158,16 +164,38 @@ impl DownloadTask {
                 )
                 .await;
 
+            processor.finish();
+
             info!("initialize_components completed: {url}");
 
             if self.token.is_cancelled() {
                 info!(url = url, "task is cancelled");
                 break components;
             }
-            // 检查流状态
-            match plugin.check_stream().await {
-                Ok(StreamStatus::Live { stream_info }) => {
-                    stream_info_ext = *stream_info;
+            // 检查流状态，避免探测请求卡住整个下载任务。
+            let check_timeout = Duration::from_secs(ctx.config().delay.clamp(5, 30));
+            let download_ended = matches!(&components, Ok(DownloadStatus::StreamEnded));
+            match tokio::time::timeout(check_timeout, plugin.check_stream()).await {
+                Ok(Ok(StreamStatus::Live { stream_info })) => {
+                    if download_ended {
+                        let confirm_delay = Duration::from_secs(2);
+                        tokio::time::sleep(confirm_delay).await;
+                        match tokio::time::timeout(check_timeout, plugin.check_stream()).await {
+                            Ok(Ok(StreamStatus::Offline)) | Ok(Err(_)) | Err(_) => {
+                                retry_count += 1;
+                                info!(
+                                    url = url,
+                                    "Download ended and recheck reported offline, stopping retry"
+                                );
+                                continue;
+                            }
+                            Ok(Ok(StreamStatus::Live { stream_info })) => {
+                                stream_info_ext = *stream_info;
+                            }
+                        }
+                    } else {
+                        stream_info_ext = *stream_info;
+                    }
                     info!(
                         url = url,
                         "Stream is still live, preparing to retry. attempt: {}", retry_count
@@ -175,17 +203,25 @@ impl DownloadTask {
                     // 成功下载后重置计数
                     retry_count = 0;
                 }
-                Ok(StreamStatus::Offline) => {
+                Ok(Ok(StreamStatus::Offline)) => {
                     retry_count += 1;
                     // 继续循环，重新执行下载
                     info!(url = url, "Stream went offline, stopping download");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     retry_count += 1;
                     // 继续循环，重新执行下载
                     warn!(
                         url = url,
                         "Failed to check stream status: {:?}, stopping download", e
+                    );
+                }
+                Err(_) => {
+                    retry_count += 1;
+                    warn!(
+                        url = url,
+                        timeout = ?check_timeout,
+                        "Timed out while checking stream status, stopping download"
                     );
                 }
             }
@@ -217,10 +253,10 @@ impl DownloadTask {
             tokio::time::sleep(delay).await;
         };
         // 异步清理任务
-        if let Some(client) = danmaku_client.clone()
-            && let Err(e) = client.stop().await
-        {
-            error!("Error stopping danmaku client: {}", e);
+        if let Some(client) = danmaku_client.clone() {
+            if let Err(e) = client.stop().await {
+                error!("Error stopping danmaku client: {}", e);
+            }
         }
         // 清理资源
         // 确保状态更新和资源清理
@@ -245,29 +281,22 @@ impl DownloadTask {
         let hook = |event| {
             match event {
                 SegmentEvent::Start { next_file_path } => {
-                    unreachable!("应没有任何位置发出此事件");
-                    // 开始下载时，获取到的是将要下载的文件名，此时文件还未生成
-                    // 触发弹幕滚动保存
-                    // if let Some(ref client) = danmaku_client
-                    //     && let Err(e) = client
-                    //     .rolling(&next_file_path.with_extension("xml").display().to_string())
-                    // {
-                    //     error!("Danmaku rolling error: {}", e);
-                    // }
+                    let _ = next_file_path;
+                    // 保留空处理，避免底层事件实现变化时直接 panic。
                 }
                 SegmentEvent::Segment(event) => {
                     // 分段时，获取到的是已下载的文件名
                     // 触发弹幕滚动保存
-                    if let Some(ref client) = danmaku_client
-                        && let Err(e) = client.rolling(
+                    if let Some(ref client) = danmaku_client {
+                        if let Err(e) = client.rolling(
                             &event
                                 .prev_file_path
                                 .with_extension("xml")
                                 .display()
                                 .to_string(),
-                        )
-                    {
-                        error!("Danmaku rolling error: {}", e);
+                        ) {
+                            error!("Danmaku rolling error: {}", e);
+                        }
                     }
                     // 异步处理事件
                     // let processor = processor.clone();
@@ -346,6 +375,7 @@ impl DActor {
                             .unwrap_or(DownloaderType::StreamGears),
                     ),
                 ));
+                ctx.change_status(Stage::Upload, WorkerStatus::Idle).await;
                 // 更新工作器状态为工作中
                 ctx.change_status(Stage::Download, WorkerStatus::Working(task.clone()))
                     .await;

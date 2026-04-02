@@ -6,14 +6,14 @@ use std::path::Path;
 
 use crate::error::{Kind, Result};
 use crate::uploader::bilibili::{BiliBili, ResponseData};
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use cookie::Cookie;
 use md5::{Digest, Md5};
 use reqwest::header::{COOKIE, ORIGIN, REFERER, USER_AGENT};
 
-use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
+use rsa::{pkcs8::DecodePublicKey, Pkcs1v15Encrypt, RsaPublicKey};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 use url::Url;
@@ -225,10 +225,11 @@ impl Credential {
         // The type of `payload` is `serde_json::Value`
         let mut rng = rand::thread_rng();
         let (key_hash, pub_key) = self.get_key().await?;
-        let pub_key = RsaPublicKey::from_public_key_pem(&pub_key).unwrap();
+        let pub_key = RsaPublicKey::from_public_key_pem(&pub_key)
+            .map_err(|e| Kind::Custom(format!("invalid public key: {e}")))?;
         let enc_data = pub_key
             .encrypt(&mut rng, Pkcs1v15Encrypt, (key_hash + password).as_bytes())
-            .expect("failed to encrypt");
+            .map_err(|e| Kind::Custom(format!("failed to encrypt password: {e}")))?;
         let encrypt_password = general_purpose::STANDARD_NO_PAD.encode(enc_data);
         let mut payload = json!({
             "actionKey": "appkey",
@@ -412,7 +413,10 @@ impl Credential {
             Some(ResponseValue::Value(data))
                 if !data["recaptcha_url"].as_str().unwrap_or("").is_empty() =>
             {
-                let url = data["recaptcha_url"].as_str().unwrap().to_string();
+                let url = data["recaptcha_url"]
+                    .as_str()
+                    .ok_or_else(|| Kind::Custom(format!("invalid recaptcha url: {data}")))?
+                    .to_string();
                 Err(Kind::NeedRecaptcha(url))
             }
             _ => Err(Kind::Custom(res.to_string())),
@@ -568,8 +572,9 @@ impl Credential {
             .form(&[("oauthKey", oauth_key)])
             .send()
             .await?.error_for_status()?;
-        self.login_by_web_cookies(&self.get_cookie("SESSDATA"), &self.get_cookie("bili_jct"))
-            .await
+        let sess_data = self.get_cookie("SESSDATA")?;
+        let bili_jct = self.get_cookie("bili_jct")?;
+        self.login_by_web_cookies(&sess_data, &bili_jct).await
     }
 
     pub async fn login_by_web_cookies(&self, sess_data: &str, bili_jct: &str) -> Result<LoginInfo> {
@@ -624,29 +629,37 @@ impl Credential {
     }
 
     fn set_cookie(&self, cookie_info: &serde_json::Value) {
-        let mut store = self.0.cookie_store.lock().unwrap();
-        for cookie in cookie_info["cookies"].as_array().unwrap() {
-            let cookie = Cookie::build((
-                cookie["name"].as_str().unwrap(),
-                cookie["value"].as_str().unwrap(),
-            ))
-            .domain("bilibili.com")
-            .into();
-
-            store
-                .insert_raw(&cookie, &Url::parse("https://bilibili.com/").unwrap())
-                .unwrap();
+        let Ok(mut store) = self.0.cookie_store.lock() else {
+            return;
+        };
+        let Some(cookies) = cookie_info["cookies"].as_array() else {
+            return;
+        };
+        let Ok(base_url) = Url::parse("https://bilibili.com/") else {
+            return;
+        };
+        for cookie in cookies {
+            let (Some(name), Some(value)) = (cookie["name"].as_str(), cookie["value"].as_str())
+            else {
+                continue;
+            };
+            let cookie = Cookie::build((name, value)).domain("bilibili.com").into();
+            let _ = store.insert_raw(&cookie, &base_url);
         }
     }
 
-    fn get_cookie(&self, name: &str) -> String {
-        let store = self.0.cookie_store.lock().unwrap();
+    fn get_cookie(&self, name: &str) -> Result<String> {
+        let store = self
+            .0
+            .cookie_store
+            .lock()
+            .map_err(|_| Kind::Custom("cookie store poisoned".into()))?;
         for item in store.iter_any() {
             if item.name() == name {
-                return item.value().to_string();
+                return Ok(item.value().to_string());
             }
         }
-        panic!("{name} not exist");
+        Err(Kind::Custom(format!("{name} not exist")))
     }
 }
 

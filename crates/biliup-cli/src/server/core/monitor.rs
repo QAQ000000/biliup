@@ -5,8 +5,8 @@ use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Context, PluginContext, Stage, Worker, WorkerStatus};
 use crate::server::infrastructure::models::StreamerInfo;
 use async_channel::Sender;
-use ormlite::Model;
 use ormlite::model::ModelBuilder;
+use ormlite::Model;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -84,10 +84,11 @@ impl Monitor {
             let url = room.get_streamer().url.clone();
             let interval = room.get_config().event_loop_interval;
             let mut ctx = PluginContext::new(room.clone(), self.pool.clone());
-            // 检查直播状态
+            // 检查直播状态，避免单次探测卡住整个轮询循环。
             let mut downloader = plugin.create_downloader(&mut ctx);
-            match downloader.check_stream().await {
-                Ok(StreamStatus::Live { mut stream_info }) => {
+            let check_timeout = Duration::from_secs(interval.clamp(5, 30));
+            match tokio::time::timeout(check_timeout, downloader.check_stream()).await {
+                Ok(Ok(StreamStatus::Live { mut stream_info })) => {
                     let sql_no_id = &stream_info.streamer_info;
                     let insert = match StreamerInfo::builder()
                         .url(sql_no_id.url.clone())
@@ -122,13 +123,21 @@ impl Monitor {
                         info!("成功开始录制 {}", url)
                     }
                 }
-                Ok(StreamStatus::Offline) => {
+                Ok(Ok(StreamStatus::Offline)) => {
                     self.wake_waker(room.id()).await;
                     debug!(url = ctx.live_streamer().url, "未开播")
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     self.wake_waker(room.id()).await;
                     error!(e=?e, ctx=ctx.live_streamer().url,"检查直播间出错")
+                }
+                Err(_) => {
+                    self.wake_waker(room.id()).await;
+                    warn!(
+                        url = ctx.live_streamer().url,
+                        timeout = ?check_timeout,
+                        "检查直播间超时"
+                    )
                 }
             };
             // 等待下一次检查
@@ -148,7 +157,13 @@ impl Monitor {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::Add(send, worker.clone());
         let _ = self.sender.send(msg).await;
-        let plugin = recv.await.expect("Actor task has been killed")?;
+        let plugin = match recv.await {
+            Ok(plugin) => plugin?,
+            Err(_) => {
+                warn!("Actor task has been killed while adding worker");
+                return None;
+            }
+        };
 
         self.rooms_handle_pool(plugin.clone());
         Some(plugin)
@@ -162,7 +177,9 @@ impl Monitor {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::AddPlugin(send, plugin);
         let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        if recv.await.is_err() {
+            warn!("Actor task has been killed while adding plugin");
+        }
     }
 
     /// 删除指定ID的工作器
@@ -182,10 +199,14 @@ impl Monitor {
         // 忽略发送错误。如果发送失败，下面的recv.await也会失败
         // 没有必要检查两次失败
         let _ = self.sender.send(msg).await;
-        if let Some(worker) = recv.await.expect("Actor task has been killed") {
-            worker
-                .change_status(Stage::Download, WorkerStatus::Idle)
-                .await;
+        match recv.await {
+            Ok(Some(worker)) => {
+                worker
+                    .change_status(Stage::Download, WorkerStatus::Idle)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(_) => warn!("Actor task has been killed while deleting worker"),
         }
     }
 
@@ -206,7 +227,13 @@ impl Monitor {
         // 忽略发送错误。如果发送失败，下面的recv.await也会失败
         // 没有必要检查两次失败
         let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("Actor task has been killed while getting worker");
+                None
+            }
+        }
     }
 
     /// 删除指定ID的工作器
@@ -223,7 +250,13 @@ impl Monitor {
         // 忽略发送错误。如果发送失败，下面的recv.await也会失败
         // 没有必要检查两次失败
         let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("Actor task has been killed while getting all workers");
+                Vec::new()
+            }
+        }
     }
 
     /// 获取下一个要处理的工作器
@@ -240,7 +273,13 @@ impl Monitor {
         // 忽略发送错误。如果发送失败，下面的recv.await也会失败
         // 没有必要检查两次失败
         let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("Actor task has been killed while fetching next worker");
+                None
+            }
+        }
     }
 
     /// 放回工作队列
@@ -257,7 +296,13 @@ impl Monitor {
 
         // 忽略发送错误
         let _ = self.sender.send(msg).await;
-        let plugin = recv.await.expect("Actor task has been killed")?;
+        let plugin = match recv.await {
+            Ok(plugin) => plugin?,
+            Err(_) => {
+                warn!("Actor task has been killed while waking worker");
+                return None;
+            }
+        };
         self.rooms_handle_pool(plugin.clone());
         Some(plugin)
     }
@@ -273,7 +318,9 @@ impl Monitor {
 
         // 忽略发送错误
         let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        if recv.await.is_err() {
+            warn!("Actor task has been killed while making worker");
+        }
     }
 
     fn spawn_monitor_task(
@@ -288,30 +335,33 @@ impl Monitor {
 
     fn rooms_handle_pool(self: &Arc<Self>, plugin: Arc<dyn DownloadPlugin + Send + Sync>) {
         let platform_name = plugin.name().to_owned();
-        match self.monitors.write().unwrap().entry(platform_name.clone()) {
-            Entry::Occupied(mut entry) => {
-                // 已经有一个任务了，检查是否结束
-                if entry.get().is_finished() {
-                    // 旧任务已经结束，重新 spawn 一个
+        match self.monitors.write() {
+            Ok(mut monitors) => match monitors.entry(platform_name.clone()) {
+                Entry::Occupied(mut entry) => {
+                    // 已经有一个任务了，检查是否结束
+                    if entry.get().is_finished() {
+                        // 旧任务已经结束，重新 spawn 一个
+                        let handle = Self::spawn_monitor_task(
+                            Arc::clone(self),
+                            plugin.clone(),
+                            platform_name.clone(),
+                        );
+                        entry.insert(handle); // 替换旧的 JoinHandle
+                    } else {
+                        // 任务还在跑，不做任何事
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    // 没有任务，正常 spawn
                     let handle = Self::spawn_monitor_task(
                         Arc::clone(self),
                         plugin.clone(),
                         platform_name.clone(),
                     );
-                    entry.insert(handle); // 替换旧的 JoinHandle
-                } else {
-                    // 任务还在跑，不做任何事
+                    entry.insert(handle);
                 }
-            }
-            Entry::Vacant(entry) => {
-                // 没有任务，正常 spawn
-                let handle = Self::spawn_monitor_task(
-                    Arc::clone(self),
-                    plugin.clone(),
-                    platform_name.clone(),
-                );
-                entry.insert(handle);
-            }
+            },
+            Err(_) => warn!("monitors lock poisoned"),
         }
     }
 }
@@ -502,7 +552,9 @@ impl RoomsActor {
         // 如果内部Vec是空的，迭代结束（虽然是循环迭代器，但空集合无法产生任何值）
         let arc = self.platforms.get_mut(platform_name)?.pop_front()?;
 
-        *arc.downloader_status.write().unwrap() = WorkerStatus::Pending;
+        if let Ok(mut guard) = arc.downloader_status.write() {
+            *guard = WorkerStatus::Pending;
+        }
 
         Some(arc)
     }
@@ -511,9 +563,14 @@ impl RoomsActor {
     fn push_back(&mut self, id: i64) -> Option<Arc<dyn DownloadPlugin + Send + Sync>> {
         // 在总数组中找不到，说明该房间已被移除我们也不放回
         let worker = self.get_worker(id)?;
-        if let WorkerStatus::Pause = *worker.downloader_status.write().unwrap() {
-            // 暂停状态则不放回
-            warn!("Paused room [{}]", worker.live_streamer.url);
+        if let Ok(mut guard) = worker.downloader_status.write() {
+            if let WorkerStatus::Pause = *guard {
+                // 暂停状态则不放回
+                warn!("Paused room [{}]", worker.live_streamer.url);
+                return None;
+            }
+        } else {
+            warn!("downloader status lock poisoned while pushing back");
             return None;
         }
         for (name, queue) in self.platforms.iter_mut() {
@@ -528,7 +585,9 @@ impl RoomsActor {
         self.platforms
             .get_mut(plugin.name())?
             .push_back(worker.clone());
-        *worker.downloader_status.write().unwrap() = WorkerStatus::Idle;
+        if let Ok(mut guard) = worker.downloader_status.write() {
+            *guard = WorkerStatus::Completed;
+        }
         Some(plugin)
     }
 
@@ -586,4 +645,75 @@ impl RoomsActor {
 
 fn reuse_vec_arc<'a, T: 'a, U: Iterator<Item = &'a Arc<T>>>(v: &mut U) -> Vec<Arc<T>> {
     v.into_iter().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::plugin::{DownloadBase, DownloadPlugin, StreamStatus};
+    use crate::server::errors::AppError;
+    use crate::server::infrastructure::connection_pool::ConnectionPool;
+    use crate::server::infrastructure::context::{Context, PluginContext};
+    use crate::server::infrastructure::models::StreamerInfo;
+    use async_trait::async_trait;
+    use error_stack::Report;
+    use std::sync::Arc;
+
+    struct DummyDownloader;
+
+    #[async_trait]
+    impl DownloadBase for DummyDownloader {
+        async fn check_stream(&mut self) -> Result<StreamStatus, Report<AppError>> {
+            Ok(StreamStatus::Offline)
+        }
+    }
+
+    struct DummyPlugin;
+
+    impl DownloadPlugin for DummyPlugin {
+        fn matches(&self, url: &str) -> bool {
+            url.contains("dummy")
+        }
+
+        fn create_downloader(&self, _ctx: &mut PluginContext) -> Box<dyn DownloadBase> {
+            Box::new(DummyDownloader)
+        }
+
+        fn name(&self) -> &str {
+            "dummy"
+        }
+    }
+
+    #[test]
+    fn reuse_vec_arc_clones_all_items() {
+        let items = vec![Arc::new(1_u32), Arc::new(2_u32), Arc::new(3_u32)];
+        let mut iter = items.iter();
+        let cloned = reuse_vec_arc(&mut iter);
+        assert_eq!(cloned.len(), 3);
+        assert_eq!(*cloned[0], 1);
+        assert_eq!(*cloned[1], 2);
+        assert_eq!(*cloned[2], 3);
+    }
+
+    #[test]
+    fn matches_returns_first_matching_plugin() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(sender);
+        let actor = RoomsActor::new(receiver);
+        let plugin = Arc::new(DummyPlugin);
+        let mut actor = actor;
+        actor.add_plugin(plugin.clone());
+
+        let matched = actor.matches("https://example.com/dummy/live");
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().name(), "dummy");
+    }
+
+    #[test]
+    fn worker_status_debug_names_are_stable() {
+        assert_eq!(format!("{:?}", WorkerStatus::Pending), "Pending");
+        assert_eq!(format!("{:?}", WorkerStatus::Completed), "Completed");
+        assert_eq!(format!("{:?}", WorkerStatus::Idle), "Idle");
+        assert_eq!(format!("{:?}", WorkerStatus::Pause), "Pause");
+    }
 }

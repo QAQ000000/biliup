@@ -1,5 +1,5 @@
 use crate::server::errors::{AppError, AppResult};
-use error_stack::{ResultExt, bail};
+use error_stack::{bail, ResultExt};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::Path;
@@ -109,27 +109,33 @@ impl HookStep {
                 .change_context(AppError::Unknown)?;
         }
 
-        let stdout = process.stdout.take().unwrap();
-        let stderr = process.stderr.take().unwrap();
+        let stdout = process
+            .stdout
+            .take()
+            .ok_or(AppError::Custom("missing stdout pipe".to_string()))?;
+        let stderr = process
+            .stderr
+            .take()
+            .ok_or(AppError::Custom("missing stderr pipe".to_string()))?;
 
         let mut stdout_lines = BufReader::new(stdout).lines();
         let mut stderr_lines = BufReader::new(stderr).lines();
 
         loop {
             tokio::select! {
-                        line = stdout_lines.next_line() => {
-                            match line.change_context(AppError::Unknown)? {
-                                Some(l) => tracing::info!(target="user_cmd_stdout", "{}", l),
-                                None => break, // stdout EOF
-                            }
-                        }
-                        line = stderr_lines.next_line() => {
-                            match line.change_context(AppError::Unknown)? {
-                                Some(l) => tracing::warn!(target="user_cmd_stderr", "{}", l),
-                                None => break, // stderr EOF
-                            }
-                        }
+                line = stdout_lines.next_line() => {
+                    match line.change_context(AppError::Unknown)? {
+                        Some(l) => tracing::info!(target="user_cmd_stdout", "{}", l),
+                        None => break, // stdout EOF
                     }
+                }
+                line = stderr_lines.next_line() => {
+                    match line.change_context(AppError::Unknown)? {
+                        Some(l) => tracing::warn!(target="user_cmd_stderr", "{}", l),
+                        None => break, // stderr EOF
+                    }
+                }
+            }
         }
 
         // 等待进程完成并检查退出状态
@@ -137,9 +143,9 @@ impl HookStep {
 
         if !status.success() {
             bail!(AppError::Custom(format!(
-                        "Command failed with status: {}",
-                        status
-                    )));
+                "Command failed with status: {}",
+                status
+            )));
         }
 
         Ok(())

@@ -13,7 +13,7 @@ use error_stack::{IntoReport, Report, ResultExt};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -24,14 +24,13 @@ use tracing::{error, warn};
 const CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
 pub struct Twitch {
-    re: Regex,
+    re: Option<Regex>,
 }
 
 impl Twitch {
     fn new() -> Twitch {
         Twitch {
-            re: Regex::new(r"https?://(?:(?:www|go|m)\.)?twitch\.tv/(?P<id>[0-9_a-zA-Z]+)")
-                .unwrap(),
+            re: Regex::new(r"https?://(?:(?:www|go|m)\.)?twitch\.tv/(?P<id>[0-9_a-zA-Z]+)").ok(),
         }
     }
 }
@@ -65,7 +64,7 @@ impl DownloadBase for TwitchDownloader {
 
 impl DownloadPlugin for Twitch {
     fn matches(&self, url: &str) -> bool {
-        self.re.is_match(url)
+        self.re.as_ref().is_some_and(|re| re.is_match(url))
     }
 
     fn create_downloader(&self, ctx: &mut PluginContext) -> Box<dyn DownloadBase> {
@@ -118,7 +117,7 @@ struct PlaybackAccessToken {
 // Twitch 下载器
 pub struct TwitchDownloader {
     url: String,
-    re: Regex,
+    re: Option<Regex>,
     twitch_danmaku: bool,
     twitch_disable_ads: bool,
     danmaku: Option<Arc<dyn DanmakuClient + Send + Sync>>,
@@ -126,7 +125,7 @@ pub struct TwitchDownloader {
 }
 
 impl TwitchDownloader {
-    pub fn new(name: &str, url: String, re: Regex) -> Self {
+    pub fn new(name: &str, url: String, re: Option<Regex>) -> Self {
         Self {
             url,
             re,
@@ -140,7 +139,8 @@ impl TwitchDownloader {
     pub async fn acheck_stream(&self) -> AppResult<StreamStatus> {
         let channel_name = self
             .re
-            .captures(&self.url)
+            .as_ref()
+            .and_then(|re| re.captures(&self.url))
             .and_then(|caps| caps.name("id"))
             .map(|m| m.as_str().to_lowercase())
             .ok_or_else(|| AppError::Custom("Invalid URL".to_string()))?;
@@ -220,7 +220,7 @@ impl TwitchDownloader {
                     date: Utc::now(),
                     live_cover_path: live_cover_url,
                 },
-                suffix: media_ext_from_url(&raw_stream_url).unwrap(),
+                suffix: media_ext_from_url(&raw_stream_url).unwrap_or_else(|| "m3u8".to_string()),
                 raw_stream_url,
                 platform: "twitch".to_string(),
                 stream_headers: HashMap::new(),
@@ -257,12 +257,14 @@ impl TwitchDownloader {
         let mut live_urls = Vec::new();
 
         for (index, gql) in gql_list.iter().enumerate() {
-            if let Some(data) = &gql.data
-                && let Some(user) = &data.user
-                && let Some(stream) = &user.stream
-                && stream.stream_type.as_deref() == Some("live")
-            {
-                live_urls.push(check_urls[index].clone());
+            if let Some(data) = &gql.data {
+                if let Some(user) = &data.user {
+                    if let Some(stream) = &user.stream {
+                        if stream.stream_type.as_deref() == Some("live") {
+                            live_urls.push(check_urls[index].clone());
+                        }
+                    }
+                }
             }
         }
 
@@ -271,12 +273,17 @@ impl TwitchDownloader {
 
     pub fn danmaku_init(&mut self) {
         if self.twitch_danmaku {
-            todo!()
+            warn!("Twitch danmaku is not implemented yet; continuing without it");
         }
     }
 
     fn gen_download_filename(&self) -> String {
-        todo!()
+        self.re
+            .as_ref()
+            .and_then(|re| re.captures(&self.url))
+            .and_then(|caps| caps.name("id"))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| "twitch_stream".to_string())
     }
 }
 
@@ -311,15 +318,15 @@ impl TwitchUtils {
             );
 
             // 第二次重试时不使用 auth_token（因为已经失效）
-            if retry == 0
-                && let Some(auth_token) = Self::get_auth_token()
-            {
-                headers.insert(
-                    "Authorization",
-                    format!("OAuth {}", auth_token)
-                        .parse()
-                        .change_context(AppError::Unknown)?,
-                );
+            if retry == 0 {
+                if let Some(auth_token) = Self::get_auth_token() {
+                    headers.insert(
+                        "Authorization",
+                        format!("OAuth {}", auth_token)
+                            .parse()
+                            .change_context(AppError::Unknown)?,
+                    );
+                }
             }
 
             let client = Client::new();

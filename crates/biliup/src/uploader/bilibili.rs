@@ -1,9 +1,9 @@
-use crate::ReqwestClientBuilderExt;
 use crate::error::{Kind, Result};
 use crate::uploader::credential::LoginInfo;
+use crate::ReqwestClientBuilderExt;
 use serde::ser::Error;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use bon::Builder;
@@ -278,6 +278,10 @@ impl BiliBili {
         proxy: Option<&str>,
     ) -> Result<ResponseData> {
         let payload = {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Kind::Custom(format!("system time error: {e}")))?
+                .as_secs();
             let mut payload = json!({
                 "access_key": self.login_info.token_info.access_token,
                 "appkey": crate::credential::AppKeyStore::BCutAndroid.app_key(),
@@ -290,7 +294,7 @@ impl BiliBili {
                 "platform": "android",
                 "s_locale": "zh-Hans_CN",
                 "sdk_type": "mon",
-                "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                "ts": ts,
             });
 
             let urlencoded = serde_urlencoded::to_string(&payload)?;
@@ -328,6 +332,10 @@ impl BiliBili {
         proxy: Option<&str>,
     ) -> Result<ResponseData> {
         let payload = {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Kind::Custom(format!("system time error: {e}")))?
+                .as_secs();
             let mut payload = json!({
                 "access_key": self.login_info.token_info.access_token,
                 "appkey": crate::credential::AppKeyStore::BiliTV.app_key(),
@@ -339,7 +347,7 @@ impl BiliBili {
                 "platform": "android",
                 "s_locale": "zh-Hans_CN",
                 "statistics": "\"appId\":1,\"platform\":3,\"version\":\"7.80.0\",\"abtest\":\"\"",
-                "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                "ts": ts,
             });
 
             let urlencoded = serde_urlencoded::to_string(&payload)?;
@@ -379,13 +387,14 @@ impl BiliBili {
     ) -> Result<ResponseData> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| Kind::Custom(format!("system time error: {e}")))?
             .as_millis();
         let csrf = self.get_csrf()?;
 
         let url_str = "https://member.bilibili.com/x/vu/web/add/v3";
         let params = [("t", ts.to_string()), ("csrf", csrf.to_string())];
-        let url = reqwest::Url::parse_with_params(url_str, &params).unwrap();
+        let url = reqwest::Url::parse_with_params(url_str, &params)
+            .map_err(|e| Kind::Custom(format!("invalid web submit url: {e}")))?;
 
         let cookie = self.get_cookie()?;
         let jar = reqwest::cookie::Jar::default();
@@ -421,7 +430,7 @@ impl BiliBili {
     pub async fn edit_by_web(&self, studio: &Studio) -> Result<serde_json::Value> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| Kind::Custom(format!("system time error: {e}")))?
             .as_millis();
         let ret: serde_json::Value = self
             .client
@@ -449,6 +458,10 @@ impl BiliBili {
         proxy: Option<&str>,
     ) -> Result<serde_json::Value> {
         let payload = {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Kind::Custom(format!("system time error: {e}")))?
+                .as_secs();
             let mut payload = json!({
                 "access_key": self.login_info.token_info.access_token,
                 "appkey": crate::credential::AppKeyStore::BiliTV.app_key(),
@@ -460,7 +473,7 @@ impl BiliBili {
                 "platform": "android",
                 "s_locale": "zh-Hans_CN",
                 "statistics": "\"appId\":1,\"platform\":3,\"version\":\"7.80.0\",\"abtest\":\"\"",
-                "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                "ts": ts,
             });
 
             let urlencoded = serde_urlencoded::to_string(&payload)?;
@@ -622,7 +635,8 @@ impl BiliBili {
     async fn archives(&self, status: &str, page_num: u32) -> Result<Value> {
         let url_str = "https://member.bilibili.com/x/web/archives";
         let params = [("status", status), ("pn", &page_num.to_string())];
-        let url = reqwest::Url::parse_with_params(url_str, &params).unwrap();
+        let url = reqwest::Url::parse_with_params(url_str, &params)
+            .map_err(|e| Kind::Custom(format!("invalid archives url: {e}")))?;
 
         let cookie = self.get_cookie()?;
         let jar = reqwest::cookie::Jar::default();

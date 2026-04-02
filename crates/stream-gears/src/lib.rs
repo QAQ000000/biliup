@@ -36,10 +36,16 @@ pub async fn download_with_hook(
     proxy: Option<&str>,
 ) -> PyResult<()> {
     let client = StatelessClient::new(headers, proxy);
-    let response = client.retryable(url).await.unwrap();
+    let response = client
+        .retryable(url)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
     let mut connection = Connection::new(response);
     // let buf = &mut [0u8; 9];
-    let bytes = connection.read_frame(9).await.unwrap();
+    let bytes = connection
+        .read_frame(9)
+        .await
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
     // response.read_exact(buf)?;
     // let out = File::create(format!("{}.flv", file_name)).expect("Unable to create file.");
     // let mut writer = BufWriter::new(out);
@@ -59,7 +65,9 @@ pub async fn download_with_hook(
         Err(e) => {
             error!("{e}");
             let file = LifecycleFile::with_hook(file_name, "ts", file_name_hook);
-            hls::download(url, &client, file, segment).await.unwrap();
+            hls::download(url, &client, file, segment)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         }
     }
     Ok(())
@@ -180,7 +188,8 @@ fn download_with_callback(
 
 #[pyfunction]
 fn login_by_cookies(file: String, proxy: Option<String>) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     let result = rt.block_on(async { login::login_by_cookies(&file, proxy.as_deref()).await });
     match result {
         Ok(_) => Ok(true),
@@ -193,7 +202,8 @@ fn login_by_cookies(file: String, proxy: Option<String>) -> PyResult<bool> {
 
 #[pyfunction]
 fn send_sms(country_code: u32, phone: u64, proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     let result =
         rt.block_on(async { login::send_sms(country_code, phone, proxy.as_deref()).await });
     match result {
@@ -207,9 +217,12 @@ fn send_sms(country_code: u32, phone: u64, proxy: Option<String>) -> PyResult<St
 
 #[pyfunction]
 fn login_by_sms(code: u32, ret: String, proxy: Option<String>) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     let result = rt.block_on(async {
-        login::login_by_sms(code, serde_json::from_str(&ret).unwrap(), proxy.as_deref()).await
+        let value = serde_json::from_str(&ret)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
+        login::login_by_sms(code, value, proxy.as_deref()).await
     });
     match result {
         Ok(_) => Ok(true),
@@ -219,7 +232,8 @@ fn login_by_sms(code: u32, ret: String, proxy: Option<String>) -> PyResult<bool>
 
 #[pyfunction]
 fn get_qrcode(proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     let result = rt.block_on(async { login::get_qrcode(proxy.as_deref()).await });
     match result {
         Ok(res) => Ok(res.to_string()),
@@ -232,12 +246,16 @@ fn get_qrcode(proxy: Option<String>) -> PyResult<String> {
 
 #[pyfunction]
 fn login_by_qrcode(ret: String, proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     rt.block_on(async {
+        let value =
+            serde_json::from_str(&ret).map_err(|e| biliup::error::Kind::Custom(format!("{e}")))?;
         let info = Credential::new(proxy.as_deref())
-            .login_by_qrcode(serde_json::from_str(&ret).unwrap())
+            .login_by_qrcode(value)
             .await?;
-        let res = serde_json::to_string_pretty(&info).unwrap();
+        let res = serde_json::to_string_pretty(&info)
+            .map_err(|e| biliup::error::Kind::Custom(format!("{e}")))?;
         Ok::<_, biliup::error::Kind>(res)
     })
     .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{:#?}", err)))
@@ -249,7 +267,8 @@ fn login_by_web_cookies(
     bili_jct: String,
     proxy: Option<String>,
 ) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     let result = rt.block_on(async {
         login::login_by_web_cookies(&sess_data, &bili_jct, proxy.as_deref()).await
     });
@@ -268,7 +287,8 @@ fn login_by_web_qrcode(
     dede_user_id: String,
     proxy: Option<String>,
 ) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
     let result = rt.block_on(async {
         login::login_by_web_qrcode(&sess_data, &dede_user_id, proxy.as_deref()).await
     });
@@ -314,7 +334,8 @@ fn upload(
     py.detach(|| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?;
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         // 输出到控制台中
         // use of deprecated function `time::util::local_offset::set_soundness`: no longer needed; TZ is refreshed manually
         // unsafe {
@@ -400,7 +421,9 @@ pub fn main_loop(py: Python<'_>) -> PyResult<()> {
     //     args.push("server".to_string());
     // }
     match args.as_slice() {
-        &[] => todo!(),
+        &[] => {
+            args.push("server".to_string());
+        }
         &[_] => {
             args.push("server".to_string());
         }

@@ -7,7 +7,7 @@ import {
     Typography,
     Popconfirm,
     Notification,
-    Card, Dropdown, Badge,
+    Card, Dropdown,
 } from '@douyinfe/semi-ui'
 import {
     IconHelpCircle,
@@ -15,7 +15,7 @@ import {
     IconVideoListStroked,
     IconEdit2Stroked,
     IconDeleteStroked,
-    IconWrench, IconTreeTriangleDown, IconPause, IconPlay, IconLock, IconUpload,
+    IconWrench, IconTreeTriangleDown, IconPause, IconPlay, IconLock,
 } from '@douyinfe/semi-icons'
 import { List, ButtonGroup } from '@douyinfe/semi-ui'
 import React, { useState } from 'react'
@@ -66,6 +66,9 @@ export default function Home() {
       case 'Pending':
         statusTag = <Tag color="indigo">检测中</Tag>
         break
+      case 'Completed':
+        statusTag = <Tag color="gray">å·²ç»æ</Tag>
+        break
       case 'OutOfSchedule':
         statusTag = <Tag color="green">非录播时间</Tag>
         break
@@ -73,6 +76,17 @@ export default function Home() {
         statusTag = <Tag color="pink">暂停中</Tag>
         break
     }
+
+    if (live.status === 'Completed') {
+      if (live.upload_status === 'Pending') {
+        statusTag = <Tag color="orange">上传中</Tag>
+      } else if (live.upload_status === 'Completed') {
+        statusTag = <Tag color="cyan">已完成</Tag>
+      } else {
+        statusTag = <Tag color="gray">已结束</Tag>
+      }
+    }
+
     return { ...handleEntityPostprocessor(live), statusTag }
   })
 
@@ -221,8 +235,6 @@ export default function Home() {
                   <div style={{ position: 'absolute', right: 20, top: 9 }}>{item.statusTag}</div>
 
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      {item.upload_status === "Pending" ? <Badge count={<IconUpload />}> </Badge> : null}
-
                     <h3
                       style={{
                         color: 'var(--semi-color-text-0)',
