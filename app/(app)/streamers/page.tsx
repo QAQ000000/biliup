@@ -67,7 +67,7 @@ export default function Home() {
         statusTag = <Tag color="indigo">检测中</Tag>
         break
       case 'Completed':
-        statusTag = <Tag color="gray">å·²ç»æ</Tag>
+        statusTag = <Tag color="grey">已结束</Tag>
         break
       case 'OutOfSchedule':
         statusTag = <Tag color="green">非录播时间</Tag>
@@ -83,7 +83,7 @@ export default function Home() {
       } else if (live.upload_status === 'Completed') {
         statusTag = <Tag color="cyan">已完成</Tag>
       } else {
-        statusTag = <Tag color="gray">已结束</Tag>
+        statusTag = <Tag color="grey">已结束</Tag>
       }
     }
 

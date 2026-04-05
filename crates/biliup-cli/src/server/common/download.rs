@@ -103,8 +103,8 @@ impl SegmentEventProcessor {
     }
 
     pub fn finish(&mut self) {
-        // Close the current segment stream so the uploader can flush
-        // and submit finished files before any retry starts a new batch.
+        // Close the current segment stream only when the task is actually ending,
+        // so transient reconnects do not split one live into multiple uploads.
         self.channel.take();
     }
 }
@@ -164,8 +164,6 @@ impl DownloadTask {
                 )
                 .await;
 
-            processor.finish();
-
             info!("initialize_components completed: {url}");
 
             if self.token.is_cancelled() {
@@ -187,7 +185,7 @@ impl DownloadTask {
                                     url = url,
                                     "Download ended and recheck reported offline, stopping retry"
                                 );
-                                continue;
+                                break components;
                             }
                             Ok(Ok(StreamStatus::Live { stream_info })) => {
                                 stream_info_ext = *stream_info;
@@ -252,6 +250,7 @@ impl DownloadTask {
             info!("Retrying download in {:?}...", delay);
             tokio::time::sleep(delay).await;
         };
+        processor.finish();
         // 异步清理任务
         if let Some(client) = danmaku_client.clone() {
             if let Err(e) = client.stop().await {
