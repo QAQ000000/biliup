@@ -1,4 +1,4 @@
-use crate::server::common::download::DownloadTask;
+use crate::server::common::download::{DownloadTask, TaskActivitySnapshot};
 use crate::server::common::util::Recorder;
 use crate::server::config::{Config, default_segment_time};
 use crate::server::core::downloader::DownloadConfig;
@@ -78,8 +78,18 @@ impl Context {
 
     pub fn status(&self, stage: Stage) -> WorkerStatus {
         match stage {
-            Stage::Download => self.worker.downloader_status.read().unwrap().clone(),
-            Stage::Upload => self.worker.uploader_status.read().unwrap().clone(),
+            Stage::Download => self
+                .worker
+                .downloader_status
+                .read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            Stage::Upload => self
+                .worker
+                .uploader_status
+                .read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -189,7 +199,11 @@ impl Worker {
     /// 获取覆写配置
     /// 返回当前的配置副本
     pub fn get_config(&self) -> Config {
-        let mut cfg = self.config.read().unwrap().clone();
+        let mut cfg = self
+            .config
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
 
         if let Some(cfg_p) = self.live_streamer.override_cfg.clone() {
             cfg.apply(cfg_p)
@@ -205,25 +219,35 @@ impl Worker {
     pub async fn change_status(&self, stage: Stage, status: WorkerStatus) {
         match stage {
             Stage::Download => {
-                let task = if let WorkerStatus::Working(task) =
-                    &*self.downloader_status.read().unwrap()
-                    && !matches!(status, WorkerStatus::Working(_))
-                {
-                    Some(task.clone())
+                let current_status = self
+                    .downloader_status
+                    .read()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                let task = if let WorkerStatus::Working(task) = &current_status {
+                    if !matches!(status, WorkerStatus::Working(_)) {
+                        Some(task.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
 
-                *self.downloader_status.write().unwrap() = status;
+                if let Ok(mut guard) = self.downloader_status.write() {
+                    *guard = status;
+                }
 
-                if let Some(task) = task
-                    && let Err(e) = task.stop().await
-                {
-                    error!(error = ?e, "Failed to stop downloader");
+                if let Some(task) = task {
+                    if let Err(e) = task.stop().await {
+                        error!(error = ?e, "Failed to stop downloader");
+                    }
                 }
             }
             Stage::Upload => {
-                *self.uploader_status.write().unwrap() = status;
+                if let Ok(mut guard) = self.uploader_status.write() {
+                    *guard = status;
+                }
             }
         }
     }
@@ -265,6 +289,8 @@ pub enum WorkerStatus {
     Working(Arc<DownloadTask>),
     /// 等待中
     Pending,
+    /// 录制已经结束
+    Completed,
     /// 空闲状态（默认）
     #[default]
     Idle,
@@ -272,16 +298,57 @@ pub enum WorkerStatus {
     Pause,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerStatusSnapshot {
+    pub raw_status: &'static str,
+    pub display_status: &'static str,
+    pub is_stale: bool,
+    pub last_activity_at: Option<u64>,
+    pub stale_after_secs: Option<u64>,
+}
+
+impl WorkerStatus {
+    pub fn raw_name(&self) -> &'static str {
+        match self {
+            WorkerStatus::Working(_) => "Working",
+            WorkerStatus::Pending => "Pending",
+            WorkerStatus::Completed => "Completed",
+            WorkerStatus::Idle => "Idle",
+            WorkerStatus::Pause => "Pause",
+        }
+    }
+
+    pub fn snapshot(&self) -> WorkerStatusSnapshot {
+        match self {
+            WorkerStatus::Working(task) => {
+                let TaskActivitySnapshot {
+                    last_activity_at,
+                    stale_after_secs,
+                } = task.activity_snapshot();
+                let is_stale = task.is_stale();
+                WorkerStatusSnapshot {
+                    raw_status: "Working",
+                    display_status: if is_stale { "Pending" } else { "Working" },
+                    is_stale,
+                    last_activity_at: Some(last_activity_at),
+                    stale_after_secs: Some(stale_after_secs),
+                }
+            }
+            _ => WorkerStatusSnapshot {
+                raw_status: self.raw_name(),
+                display_status: self.raw_name(),
+                is_stale: false,
+                last_activity_at: None,
+                stale_after_secs: None,
+            },
+        }
+    }
+}
+
 // 简单 Debug：打印状态名，忽略内部 downloader
 impl fmt::Debug for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            WorkerStatus::Working(_) => "Working",
-            WorkerStatus::Pending => "Pending",
-            WorkerStatus::Idle => "Idle",
-            WorkerStatus::Pause => "Pause",
-        };
-        f.write_str(name)
+        f.write_str(self.raw_name())
     }
 }
 
@@ -331,5 +398,29 @@ impl PluginContext {
 
     pub fn client(&self) -> reqwest::Client {
         self.worker.client.client.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::downloader::{DownloaderRuntime, DownloaderType};
+    use std::time::Duration;
+
+    #[test]
+    fn stale_working_status_is_downgraded_for_api_display_only() {
+        let task = Arc::new(DownloadTask::new(
+            DownloaderRuntime::from_type(DownloaderType::StreamGears),
+            Duration::from_secs(1),
+        ));
+        task.set_last_activity_at_for_test(0);
+
+        let snapshot = WorkerStatus::Working(task).snapshot();
+
+        assert_eq!(snapshot.raw_status, "Working");
+        assert_eq!(snapshot.display_status, "Pending");
+        assert!(snapshot.is_stale);
+        assert_eq!(snapshot.last_activity_at, Some(0));
+        assert_eq!(snapshot.stale_after_secs, Some(1));
     }
 }

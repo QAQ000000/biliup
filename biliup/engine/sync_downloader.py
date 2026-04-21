@@ -11,6 +11,10 @@ from urllib.parse import urlparse
 
 
 logger = logging.getLogger('biliup.engine.sync_downloader')
+_STREAM_READ_EOF = object()
+SEGMENT_COMPLETE = object()
+SEGMENT_RETRY = object()
+DOWNLOAD_STOP = object()
 
 
 def pad_file_to_size(filename, min_file_size):
@@ -61,77 +65,125 @@ class SyncDownloader:
         self.read_block_size = 500
         self.max_file_size = max_file_size
         self.output_prefix = output_prefix
+        self.idle_timeout = 45
+        self.process_exit_timeout = 5
+        self.max_retries = 5
+        self.watchdog_poll_interval = 1
 
         self.video_queue: queue.SimpleQueue = video_queue
         self.stop_event = threading.Event()
 
+    def _terminate_process(self, proc, name):
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=self.process_exit_timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[run] {name} 在 {self.process_exit_timeout}s 内未退出，强制 kill")
+            proc.kill()
+            proc.wait(timeout=self.process_exit_timeout)
+        except Exception:
+            logger.exception(f"[run] 终止 {name} 失败")
+
+    def _log_process_stderr(self, proc, name):
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            err = proc.stderr.read()
+        except Exception:
+            logger.exception(f"[run] 读取 {name} stderr 失败")
+            return
+        if err:
+            logger.error(f"[run] {name} err {err.decode('utf-8', errors='replace')}")
+
+    def _read_stdout(self, stdout, output_queue):
+        try:
+            while True:
+                data = stdout.read(self.read_block_size)
+                if not data:
+                    output_queue.put(_STREAM_READ_EOF)
+                    return
+                output_queue.put(data)
+        except Exception as exc:
+            output_queue.put(("error", exc))
+
+    def _drain_ffmpeg_output(self, ffmpeg_proc, upstream_proc=None):
+        output_queue = queue.Queue()
+        reader_thread = threading.Thread(
+            target=self._read_stdout,
+            args=(ffmpeg_proc.stdout, output_queue),
+            daemon=True,
+            name="sync_downloader_stdout",
+        )
+        reader_thread.start()
+
+        has_data = False
+        last_output_at = time.monotonic()
+        while True:
+            if self.stop_event.is_set():
+                logger.info("[run] 收到 stop_event，终止当前下载段")
+                self._terminate_process(ffmpeg_proc, "ffmpeg")
+                self._terminate_process(upstream_proc, "streamlink")
+                return "stopped", has_data
+
+            try:
+                item = output_queue.get(timeout=self.watchdog_poll_interval)
+            except queue.Empty:
+                if time.monotonic() - last_output_at < self.idle_timeout:
+                    continue
+                logger.warning(f"[run] ffmpeg 连续 {self.idle_timeout}s 无输出，终止当前下载段")
+                self._terminate_process(ffmpeg_proc, "ffmpeg")
+                self._terminate_process(upstream_proc, "streamlink")
+                self._log_process_stderr(ffmpeg_proc, "ffmpeg")
+                self._log_process_stderr(upstream_proc, "streamlink")
+                return "idle_timeout", has_data
+
+            if item is _STREAM_READ_EOF:
+                if has_data:
+                    logger.info("[run] ffmpeg stdout 已到达 EOF。结束本段写入。")
+                else:
+                    logger.info("[run] ffmpeg 没有输出数据。")
+                break
+
+            if isinstance(item, tuple) and item[0] == "error":
+                logger.error(f"[run] 读取 ffmpeg stdout 失败: {item[1]}")
+                self._terminate_process(ffmpeg_proc, "ffmpeg")
+                self._terminate_process(upstream_proc, "streamlink")
+                self._log_process_stderr(ffmpeg_proc, "ffmpeg")
+                self._log_process_stderr(upstream_proc, "streamlink")
+                return "read_error", has_data
+
+            has_data = True
+            last_output_at = time.monotonic()
+            self.video_queue.put(item)
+
+        ffmpeg_proc.wait()
+        if upstream_proc is not None:
+            self._terminate_process(upstream_proc, "streamlink")
+            self._log_process_stderr(upstream_proc, "streamlink")
+
+        if ffmpeg_proc.returncode != 0:
+            logger.warning(f"[run] ffmpeg 异常退出，returncode={ffmpeg_proc.returncode}")
+            self._log_process_stderr(ffmpeg_proc, "ffmpeg")
+            return "ffmpeg_error", has_data
+
+        if has_data:
+            return "completed", True
+        return "empty", False
+
     def run_ffmpeg_with_url(self, ffmpeg_cmd, output_filename):
         with subprocess.Popen(ffmpeg_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE) as ffmpeg_proc:
             logger.info("[run] 启动 ffmpeg...")
-            if output_filename == "-":
-                data = ffmpeg_proc.stdout.read(self.read_block_size)  # 读取第一个 data
-                if not data:  # 如果第一个 data 为空
-                    logger.info("[run] ffmpeg 没有输出数据，返回 False")
-                    err = ffmpeg_proc.stderr.read()
-                    if err:
-                        logger.error("[run] ffmpeg err " + err.decode("utf-8", errors="replace"))
-                    return False
-                self.video_queue.put(data)  # 将第一个数据放入队列
-                while True:
-                    data = ffmpeg_proc.stdout.read(self.read_block_size)
-                    if not data:
-                        logger.info("[run] ffmpeg stdout 已到达 EOF。结束本段写入。")
-                        break
-                    self.video_queue.put(data)
-            ffmpeg_proc.wait()
-            # 输出 ffmpeg 的错误信息（如果有的话）
-            # err = ffmpeg_proc.stderr.read()
-            # if err:
-            #     logger.error("[run] ffmpeg err " + err.decode("utf-8", errors="replace"))
-        return True  # 如果正常执行，返回 True
+            return self._drain_ffmpeg_output(ffmpeg_proc)
 
     def run_streamlink_with_ffmpeg(self, streamlink_cmd, ffmpeg_cmd, output_filename):
         with subprocess.Popen(streamlink_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as streamlink_proc:
             logger.info("[run] 启动 streamlink...")
             with subprocess.Popen(ffmpeg_cmd, stdin=streamlink_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as ffmpeg_proc:
                 logger.info("[run] 启动 ffmpeg...")
-                if output_filename == "-":
-                    logger.info("[run] 读取 ffmpeg stdout...")
-                    # 读取第一个数据
-                    data = ffmpeg_proc.stdout.read(self.read_block_size)
-                    if not data:  # 如果第一个数据为空
-                        logger.info("[run] ffmpeg 没有输出数据，返回 False")
-                        streamlink_proc.kill()  # 终止 streamlink 进程
-                        ffmpeg_proc.kill()  # 终止 ffmpeg 进程
-                        # 打印错误输出
-                        ffmpeg_err = ffmpeg_proc.stderr.read()
-                        if ffmpeg_err:
-                            logger.error("[run] ffmpeg err " + ffmpeg_err.decode("utf-8", errors="replace"))
-                        streamlink_err = streamlink_proc.stderr.read()
-                        if streamlink_err:
-                            logger.error("[run] streamlink err " + streamlink_err.decode("utf-8", errors="replace"))
-                        return False
-
-                    self.video_queue.put(data)  # 将第一个数据放入队列
-                    # 继续读取剩余数据
-                    while True:
-                        data = ffmpeg_proc.stdout.read(self.read_block_size)
-                        if not data:
-                            logger.info("[run] ffmpeg stdout 已到达 EOF。结束本段写入。")
-                            break
-                        self.video_queue.put(data)
-
-                ffmpeg_proc.wait()
-                logger.info("[run] ffmpeg 已到达输出大小并退出。结束本段写入。")
-                # 打印 ffmpeg 子进程的错误输出
-                # ffmpeg_err = ffmpeg_proc.stderr.read()
-                # if ffmpeg_err:
-                # logger.error("[run] ffmpeg err " + ffmpeg_err.decode("utf-8", errors="replace"))
-            # 打印 streamlink 子进程的错误输出
-            # streamlink_err = streamlink_proc.stderr.read()
-            # if streamlink_err:
-            #     logger.error("[run] streamlink err " + streamlink_err.decode("utf-8", errors="replace"))
-        return True  # 如果一切正常，返回 True
+                logger.info("[run] 读取 ffmpeg stdout...")
+                return self._drain_ffmpeg_output(ffmpeg_proc, streamlink_proc)
 
     def build_ffmpeg_cmd(self, input_source, output_filename, headers, segment_duration):
         cmd = [
@@ -173,9 +225,12 @@ class SyncDownloader:
         retry_count = 0
         while True:
             if self.stop_event.is_set():
-                break
-            if retry_count >= 5:
+                self.video_queue.put(DOWNLOAD_STOP)
+                return
+            if retry_count >= self.max_retries:
                 logger.info("这个直播流已经失效，停止下载器")
+                self.stop_event.set()
+                self.video_queue.put(DOWNLOAD_STOP)
                 return
 
             output_filename = f"{self.output_prefix}{file_index:03d}.mkv"
@@ -189,15 +244,12 @@ class SyncDownloader:
                 logger.info("[run] 输入源不是 HLS 地址，将直接使用 ffmpeg 进行录制。")
                 ffmpeg_cmd = self.build_ffmpeg_cmd(self.stream_url, output_filename,
                                                    self.headers, self.segment_duration)
-                if not self.run_ffmpeg_with_url(ffmpeg_cmd, output_filename):
-                    retry_count += 1
-                    time.sleep(1)
-                    continue
+                status, has_data = self.run_ffmpeg_with_url(ffmpeg_cmd, output_filename)
             else:
                 # print("[run] 输入源是 HLS 地址，将使用 streamlink + ffmpeg 进行录制。")
                 logger.info("[run] 输入源是 HLS 地址，将使用 streamlink + ffmpeg 进行录制。")
+                headers = []
                 if self.headers:
-                    headers = []
                     for key, value in self.headers.items():
                         headers.extend(['--http-header', f'{key}={value}'])
                 streamlink_cmd = [
@@ -212,15 +264,43 @@ class SyncDownloader:
                 logger.info(f"[run] streamlink_cmd: {streamlink_cmd}")
                 # output_filename = "-"
                 ffmpeg_cmd = self.build_ffmpeg_cmd("pipe:0", output_filename, None, self.segment_duration)
-                if not self.run_streamlink_with_ffmpeg(streamlink_cmd, ffmpeg_cmd, output_filename):
-                    retry_count += 1
-                    time.sleep(1)
-                    continue
+                status, has_data = self.run_streamlink_with_ffmpeg(streamlink_cmd, ffmpeg_cmd, output_filename)
 
-            # 6. 进入下一段
-            # if file_index != 1:
-            self.video_queue.put(None)  # 通知消费者线程本段录制结束
-            file_index += 1
+            if status == "completed":
+                self.video_queue.put(SEGMENT_COMPLETE)
+                file_index += 1
+                retry_count = 0
+                continue
+
+            if status == "stopped":
+                self.video_queue.put(DOWNLOAD_STOP)
+                return
+
+            retry_count += 1
+            if has_data:
+                logger.warning(f"[run] 当前下载段异常中断，将收口本段后重试，status={status} retry={retry_count}/{self.max_retries}")
+                if retry_count >= self.max_retries:
+                    logger.info("这个直播流已经连续异常，停止下载器")
+                    self.stop_event.set()
+                    self.video_queue.put(DOWNLOAD_STOP)
+                    return
+                self.video_queue.put(SEGMENT_RETRY)
+                file_index += 1
+                time.sleep(1)
+                continue
+
+            if retry_count >= self.max_retries:
+                logger.info("这个直播流已经失效，停止下载器")
+                self.stop_event.set()
+                self.video_queue.put(DOWNLOAD_STOP)
+                return
+
+            if status != "empty":
+                logger.warning(f"[run] 下载段失败，准备重试，status={status} retry={retry_count}/{self.max_retries}")
+                time.sleep(1)
+            else:
+                logger.info(f"[run] 当前下载段没有产出数据，等待重试 {retry_count}/{self.max_retries}")
+                time.sleep(1)
 
 
 def main():
@@ -239,7 +319,12 @@ def main():
             with open(f"output_{file_index}.mkv", "wb") as f:
                 while True:
                     data = slicer.video_queue.get()  # 阻塞式获取
-                    if data is None:
+                    if data is SEGMENT_COMPLETE:
+                        break
+                    if data is SEGMENT_RETRY:
+                        break
+                    if data is DOWNLOAD_STOP:
+                        slicer.stop_event.set()
                         break
                     f.write(data)
                     data_count += len(data)

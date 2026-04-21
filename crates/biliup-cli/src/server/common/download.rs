@@ -17,10 +17,33 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+const MIN_STALE_WORKING_SECS: u64 = 15 * 60;
+const STALE_DELAY_MULTIPLIER: u64 = 2;
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn parse_duration_to_secs(duration: &str) -> u64 {
+    let mut parts = duration.split(':');
+    let hours = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let minutes = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let seconds = parts.next().and_then(|part| part.parse::<u64>().ok());
+
+    match (hours, minutes, seconds, parts.next()) {
+        (Some(hours), Some(minutes), Some(seconds), None) => hours * 3600 + minutes * 60 + seconds,
+        _ => 0,
+    }
+}
 
 // Configuration and retry policy
 #[derive(Debug, Clone)]
@@ -101,6 +124,12 @@ impl SegmentEventProcessor {
 
         Ok(())
     }
+
+    pub fn finish(&mut self) {
+        // Close the current segment stream so the uploader can flush
+        // and submit finished files before any retry starts a new batch.
+        self.channel.take();
+    }
 }
 
 /// 下载任务
@@ -108,15 +137,63 @@ pub struct DownloadTask {
     token: CancellationToken,
     done_notify: Notify,
     downloader: DownloaderRuntime,
+    last_activity_at: AtomicU64,
+    stale_after_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TaskActivitySnapshot {
+    pub last_activity_at: u64,
+    pub stale_after_secs: u64,
 }
 
 impl DownloadTask {
-    pub fn new(downloader: DownloaderRuntime) -> Self {
+    pub fn new(downloader: DownloaderRuntime, stale_after: Duration) -> Self {
         Self {
             token: CancellationToken::new(),
             done_notify: Notify::new(),
             downloader,
+            last_activity_at: AtomicU64::new(unix_timestamp_secs()),
+            stale_after_secs: stale_after.as_secs().max(1),
         }
+    }
+
+    pub(crate) fn stale_window(ctx: &Context) -> Duration {
+        let config = ctx.config();
+        let segment_secs = config
+            .segment_time
+            .clone()
+            .or_else(default_segment_time)
+            .as_deref()
+            .map(parse_duration_to_secs)
+            .unwrap_or_default();
+        let stale_after_secs = segment_secs
+            .saturating_add(config.delay.saturating_mul(STALE_DELAY_MULTIPLIER))
+            .max(MIN_STALE_WORKING_SECS);
+
+        Duration::from_secs(stale_after_secs)
+    }
+
+    pub(crate) fn touch_activity(&self) {
+        self.last_activity_at
+            .store(unix_timestamp_secs(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn activity_snapshot(&self) -> TaskActivitySnapshot {
+        TaskActivitySnapshot {
+            last_activity_at: self.last_activity_at.load(Ordering::Relaxed),
+            stale_after_secs: self.stale_after_secs,
+        }
+    }
+
+    pub(crate) fn is_stale(&self) -> bool {
+        let snapshot = self.activity_snapshot();
+        unix_timestamp_secs().saturating_sub(snapshot.last_activity_at) >= snapshot.stale_after_secs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_activity_at_for_test(&self, timestamp: u64) {
+        self.last_activity_at.store(timestamp, Ordering::Relaxed);
     }
 
     pub(self) async fn execute(
@@ -145,7 +222,9 @@ impl DownloadTask {
 
         // 初始化组件
         let mut processor = SegmentEventProcessor::new(sender, ctx.clone());
+        self.touch_activity();
         let result = loop {
+            self.touch_activity();
             // 创建守卫确保清理
             // 创建事件处理器
             // 执行下载
@@ -158,16 +237,41 @@ impl DownloadTask {
                 )
                 .await;
 
+            processor.finish();
+
             info!("initialize_components completed: {url}");
 
             if self.token.is_cancelled() {
                 info!(url = url, "task is cancelled");
                 break components;
             }
-            // 检查流状态
-            match plugin.check_stream().await {
-                Ok(StreamStatus::Live { stream_info }) => {
-                    stream_info_ext = *stream_info;
+            // 检查流状态，避免探测请求卡住整个下载任务。
+            let check_timeout = Duration::from_secs(ctx.config().delay.clamp(5, 30));
+            let download_ended = matches!(&components, Ok(DownloadStatus::StreamEnded));
+            match tokio::time::timeout(check_timeout, plugin.check_stream()).await {
+                Ok(Ok(StreamStatus::Live { stream_info })) => {
+                    self.touch_activity();
+                    if download_ended {
+                        let confirm_delay = Duration::from_secs(2);
+                        tokio::time::sleep(confirm_delay).await;
+                        match tokio::time::timeout(check_timeout, plugin.check_stream()).await {
+                            Ok(Ok(StreamStatus::Offline)) | Ok(Err(_)) | Err(_) => {
+                                self.touch_activity();
+                                retry_count += 1;
+                                info!(
+                                    url = url,
+                                    "Download ended and recheck reported offline, stopping download"
+                                );
+                                break components;
+                            }
+                            Ok(Ok(StreamStatus::Live { stream_info })) => {
+                                self.touch_activity();
+                                stream_info_ext = *stream_info;
+                            }
+                        }
+                    } else {
+                        stream_info_ext = *stream_info;
+                    }
                     info!(
                         url = url,
                         "Stream is still live, preparing to retry. attempt: {}", retry_count
@@ -175,17 +279,28 @@ impl DownloadTask {
                     // 成功下载后重置计数
                     retry_count = 0;
                 }
-                Ok(StreamStatus::Offline) => {
+                Ok(Ok(StreamStatus::Offline)) => {
+                    self.touch_activity();
                     retry_count += 1;
                     // 继续循环，重新执行下载
                     info!(url = url, "Stream went offline, stopping download");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
+                    self.touch_activity();
                     retry_count += 1;
                     // 继续循环，重新执行下载
                     warn!(
                         url = url,
                         "Failed to check stream status: {:?}, stopping download", e
+                    );
+                }
+                Err(_) => {
+                    self.touch_activity();
+                    retry_count += 1;
+                    warn!(
+                        url = url,
+                        timeout = ?check_timeout,
+                        "Timed out while checking stream status, stopping download"
                     );
                 }
             }
@@ -217,10 +332,10 @@ impl DownloadTask {
             tokio::time::sleep(delay).await;
         };
         // 异步清理任务
-        if let Some(client) = danmaku_client.clone()
-            && let Err(e) = client.stop().await
-        {
-            error!("Error stopping danmaku client: {}", e);
+        if let Some(client) = danmaku_client.clone() {
+            if let Err(e) = client.stop().await {
+                error!("Error stopping danmaku client: {}", e);
+            }
         }
         // 清理资源
         // 确保状态更新和资源清理
@@ -245,29 +360,24 @@ impl DownloadTask {
         let hook = |event| {
             match event {
                 SegmentEvent::Start { next_file_path } => {
-                    unreachable!("应没有任何位置发出此事件");
-                    // 开始下载时，获取到的是将要下载的文件名，此时文件还未生成
-                    // 触发弹幕滚动保存
-                    // if let Some(ref client) = danmaku_client
-                    //     && let Err(e) = client
-                    //     .rolling(&next_file_path.with_extension("xml").display().to_string())
-                    // {
-                    //     error!("Danmaku rolling error: {}", e);
-                    // }
+                    self.touch_activity();
+                    let _ = next_file_path;
+                    // 保留空处理，避免底层事件实现变化时直接 panic。
                 }
                 SegmentEvent::Segment(event) => {
+                    self.touch_activity();
                     // 分段时，获取到的是已下载的文件名
                     // 触发弹幕滚动保存
-                    if let Some(ref client) = danmaku_client
-                        && let Err(e) = client.rolling(
+                    if let Some(ref client) = danmaku_client {
+                        if let Err(e) = client.rolling(
                             &event
                                 .prev_file_path
                                 .with_extension("xml")
                                 .display()
                                 .to_string(),
-                        )
-                    {
-                        error!("Danmaku rolling error: {}", e);
+                        ) {
+                            error!("Danmaku rolling error: {}", e);
+                        }
                     }
                     // 异步处理事件
                     // let processor = processor.clone();
@@ -283,6 +393,7 @@ impl DownloadTask {
             .download(Box::new(hook), ctx.download_config(ext))
             .await
             .change_context(AppError::Custom("Failed to download segment".into()))?;
+        self.touch_activity();
 
         // 处理结果
         info!(url=streamer.url,result=?result, "finished downloading");
@@ -292,6 +403,7 @@ impl DownloadTask {
     pub(crate) async fn stop(&self) -> AppResult<()> {
         // 仅发出取消信号并更新状态
         // 如果底层下载函数不支持取消，这里不能真正中断正在进行的下载
+        self.touch_activity();
         self.token.cancel();
         self.downloader.stop().await?;
         self.done_notify.notified().await;
@@ -339,13 +451,16 @@ impl DActor {
         match msg {
             DownloaderMessage::Start(downloader, ctx) => {
                 // 创建下载任务
+                let stale_after = DownloadTask::stale_window(&ctx);
                 let task = Arc::new(DownloadTask::new(
                     downloader.downloader(
                         ctx.config()
                             .downloader
                             .unwrap_or(DownloaderType::StreamGears),
                     ),
+                    stale_after,
                 ));
+                ctx.change_status(Stage::Upload, WorkerStatus::Idle).await;
                 // 更新工作器状态为工作中
                 ctx.change_status(Stage::Download, WorkerStatus::Working(task.clone()))
                     .await;

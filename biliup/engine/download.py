@@ -136,7 +136,9 @@ class DownloadBase(ABC):
                                 max_file_size=int(self.file_size / 1024 / 1024),
                                 output_prefix=self.gen_download_filename(True),
                                 stream_info=stream_info,
-                                file_name_callback=lambda file_name: self.__download_segment_callback(file_name), database_row_id=self.database_row_id)
+                                file_name_callback=lambda file_name: self.__download_segment_callback(file_name),
+                                database_row_id=self.database_row_id,
+                                app_config=self.config)
                     return True
                 # streamlink无法处理flv,所以回退到ffmpeg
                 if self.downloader == 'streamlink' and '.flv' not in parsed_url_path:
@@ -470,34 +472,43 @@ def stream_gears_download(url, headers, file_name, segment_time=None, file_size=
         )
 
 
-def sync_download(stream_url, headers, segment_duration=60, max_file_size=100, output_prefix="segment", stream_info=None, file_name_callback: Callable[[str], None] = None, database_row_id=0):
+def sync_download(stream_url, headers, segment_duration=60, max_file_size=100, output_prefix="segment",
+                  stream_info=None, file_name_callback: Callable[[str], None] = None, database_row_id=0,
+                  app_config=None):
     logger.info(f"启动同步下载器 max_file_size {max_file_size}MB")
     video_queue = queue.SimpleQueue()
 
+    if stream_info is None:
+        stream_info = {}
+    else:
+        stream_info = dict(stream_info)
+
+    if app_config is None:
+        app_config = {}
+
+    stream_name = stream_info.get("name", "unknown")
+
+    def prepare_stream_info(base_stream_info):
+        prepared_info = dict(base_stream_info)
+        prepared_info.setdefault("name", "unknown")
+        prepared_info.setdefault("title", prepared_info.get("name", ""))
+        prepared_info.setdefault("description", "")
+        prepared_info.setdefault("format_title", prepared_info.get("title") or prepared_info.get("name", ""))
+        if "format_title" not in base_stream_info:
+            logger.warning(f"{prepared_info['name']} 未找到历史格式化链路，回退使用原始标题")
+        return prepared_info
+
     def upload(video_queue, stream_info, stop_event: threading.Event):
-        with SessionLocal() as db:
-            data = get_stream_info(db, f"{stream_info['name']}")
-        data = {**data, "name": stream_info['name']}
-        if "title" not in data:
-            data["title"] = stream_info.get("title", "")
-        # 使用 fmt_title_and_desc 生成格式化后的标题和简介
-        # fmt_title_and_desc 返回 (data, context)，其中 context 中包含已格式化的 description
-        data, context_fmt = fmt_title_and_desc(data)
-
-        # 更新基本信息（含 format_title）
-        stream_info.update(data)
-
-        # 若存在格式化后的简介，将其写入 stream_info，保证后续上传时使用正确的简介
-        if context_fmt.get('description'):
-            stream_info['description'] = context_fmt['description']
+        stream_info = prepare_stream_info(stream_info)
         logger.info(f"stream_info: {stream_info}")
         # 获取 BiliWebAsync.__init__ 的参数名
         init_params = inspect.signature(BiliWebAsync.__init__).parameters
         # 过滤 info 中的无关键
         filtered_info = {key: value for key, value in stream_info.items() if key in init_params}
 
-        filtered_info['submit_api'] = config.get('submit_api')
-        filtered_info['lines'] = config.get('lines', 'AUTO')
+        filtered_info['submit_api'] = app_config.get('submit_api')
+        filtered_info['lines'] = app_config.get('lines', 'AUTO')
+        filtered_info['app_config'] = app_config
         # 映射 'uploader' 到 'principal'
         filtered_info['principal'] = ""
         filtered_info["data"] = stream_info
@@ -516,7 +527,11 @@ def sync_download(stream_url, headers, segment_duration=60, max_file_size=100, o
     upload_thread.start()
 
     downloader.run()
-    logger.info(f"{stream_info['name']} 下载器结束")
+    downloader.stop_event.set()
+    upload_thread.join(timeout=15)
+    if upload_thread.is_alive():
+        logger.warning(f"{stream_name} 上传线程在下载器退出后 15s 内未结束，将继续后台回收")
+    logger.info(f"{stream_name} 下载器结束")
 
 
 def get_valid_filename(name):

@@ -28,6 +28,7 @@ import xml.etree.ElementTree as ET
 from requests.adapters import HTTPAdapter, Retry
 
 from ..engine import Plugin
+from ..engine.sync_downloader import DOWNLOAD_STOP, SEGMENT_COMPLETE, SEGMENT_RETRY
 from ..engine.upload import UploadBase, logger
 
 
@@ -40,7 +41,8 @@ class BiliWebAsync(UploadBase):
             self, principal, data, submit_api=None, copyright=2, postprocessor=None, dtime=None,
             dynamic='', lines='AUTO', threads=3, tid=122, tags=None, cover_path=None, description='',
             dolby=0, hires=0, no_reprint=0, is_only_self=0, charging_pay=0, credits=None,
-            user_cookie='cookies.json', copyright_source=None, extra_fields="", video_queue=None
+            user_cookie='cookies.json', copyright_source=None, extra_fields="", video_queue=None,
+            app_config=None
     ):
         super().__init__(principal, data, persistence_path='bili.cookie', postprocessor=postprocessor)
         if credits is None:
@@ -73,13 +75,14 @@ class BiliWebAsync(UploadBase):
 
         self.user_cookie = user_cookie
         self.video_queue: queue.SimpleQueue = video_queue
+        self.app_config = app_config or {}
 
     def upload(self, total_size: int, stop_event: threading.Event, output_prefix: str, file_name_callback: Callable[[str], None] = None, database_row_id=0) -> List[UploadBase.FileInfo]:
         # print("开始同步上传")
         logger.info(f"开始同步上传 {database_row_id}")
         file_index = 1
         videos = Data()
-        bili = BiliBili(videos)
+        bili = BiliBili(videos, self.app_config)
         bili.database_row_id = database_row_id
 
         bili.login(self.persistence_path, self.user_cookie)
@@ -126,6 +129,9 @@ class BiliWebAsync(UploadBase):
             # file_name_callback(file_name)
             data_size = 0
             video_upload_queue = queue.SimpleQueue()
+            segment_completed = False
+            segment_retry = False
+            stop_requested = False
 
             t = threading.Thread(target=bili.upload_stream, args=(video_upload_queue,
                                  file_name, total_size, self.lines, videos, stop_event, file_name_callback), daemon=True, name=f"upload_{file_index}")
@@ -134,12 +140,26 @@ class BiliWebAsync(UploadBase):
 
             while True:
                 try:
-                    data = self.video_queue.get(timeout=10)
+                    data = self.video_queue.get(timeout=1)
                 except queue.Empty:
+                    if stop_event.is_set():
+                        stop_requested = True
+                        break
+                    continue
+
+                if data is SEGMENT_COMPLETE:
+                    video_upload_queue.put(None)
+                    segment_completed = True
                     break
 
-                if data is None:
+                if data is SEGMENT_RETRY:
                     video_upload_queue.put(None)
+                    segment_retry = True
+                    break
+
+                if data is DOWNLOAD_STOP:
+                    video_upload_queue.put(None)
+                    stop_requested = True
                     break
 
                 video_upload_queue.put(data)
@@ -147,13 +167,21 @@ class BiliWebAsync(UploadBase):
                 data_size += len(data)
             # print(f"[consumer] 读取 {file_name} {data_size} 字节")
             logger.info(f"[consumer] 读取 {file_name} {data_size} 字节")
-            file_index += 1
+            if segment_completed or segment_retry:
+                file_index += 1
             # print("[consumer] bili.video.videos", bili.video.videos)
             logger.info(f"[consumer] bili.video.videos {bili.video.videos}")
             if data_size < 100:
                 # print(f"[consumer] 停止下载回调")
                 # n = video_upload_queue.get()
                 logger.info(f"[consumer] 停止下载回调")
+                stop_event.set()
+                break
+            if segment_retry:
+                logger.info("[consumer] 当前分段异常收口，准备等待下一段重试数据")
+                continue
+            if stop_requested:
+                logger.info("[consumer] 检测到下载停止，结束同步上传")
                 stop_event.set()
                 break
 
@@ -200,7 +228,7 @@ class BiliWebAsync(UploadBase):
 
 
 class BiliBili:
-    def __init__(self, video: 'Data'):
+    def __init__(self, video: 'Data', app_config=None):
         self.app_key = None
         self.appsec = None
         # if self.app_key is None or self.appsec is None:
@@ -221,8 +249,9 @@ class BiliBili:
         self.__bili_jct = None
         self._auto_os = None
         self.persistence_path = 'engine/bili.cookie'
+        self.app_config = app_config or {}
 
-        self.save_dir = config.get('sync_save_dir', None)
+        self.save_dir = self.app_config.get('sync_save_dir', None)
         self.save_path = ''
         if self.save_dir and not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
@@ -602,7 +631,7 @@ class BiliBili:
 
         while chunks_yielded < total_chunks:
             try:
-                data = simple_queue.get(timeout=10)
+                data = simple_queue.get(timeout=1)
             except queue.Empty:
                 break
 
@@ -709,7 +738,11 @@ class BiliBili:
             ret = self.__session.post(api, timeout=5, json=post_data).json()
             if ret['code'] == -101:
                 logger.info(f'刷新token{ret}')
-                self.login_by_password(**config['user']['account'])
+                account = self.app_config.get('user', {}).get('account')
+                if not account:
+                    logger.error('刷新 token 失败: 未提供 user.account 配置')
+                    return ret
+                self.login_by_password(**account)
                 self.store()
                 continue
             return ret
